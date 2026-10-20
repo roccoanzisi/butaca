@@ -91,6 +91,8 @@
         </div>
 
         <div class="panel__bloque panel__bloque--pie">
+          <h2 class="panel__titulo">Sonido</h2>
+          <button class="boton boton--chico" id="btn-micro" type="button" aria-pressed="false">Activar micrófono</button>
           <p class="panel__nota" id="cabina-sonido"></p>
           <button class="boton boton--peligro" id="btn-cortar" type="button" hidden>Cortar transmisión</button>
         </div>
@@ -119,7 +121,7 @@
       </header>
 
       <section class="pantalla pantalla--sala" id="sala-pantalla" aria-label="Transmisión">
-        <video id="sala-video" class="pantalla__video" playsinline autoplay></video>
+        <video id="sala-video" class="pantalla__video" playsinline autoplay muted></video>
         <div class="pantalla__aviso" id="sala-aviso">
           <p class="pantalla__titulo" id="sala-aviso-titulo">Buscando la sala</p>
           <p class="pantalla__texto" id="sala-aviso-texto">Un momento.</p>
@@ -129,8 +131,11 @@
 
       <footer class="controles">
         <button class="boton boton--chico" id="btn-mute" type="button" aria-pressed="false">Silenciar</button>
-        <label class="volumen"><span class="sr">Volumen</span>
-          <input id="sala-volumen" type="range" min="0" max="1" step="0.05" value="1">
+        <label class="volumen" id="sala-control-pantalla" hidden><span class="volumen__nombre">Pantalla</span>
+          <input id="sala-vol-pantalla" type="range" min="0" max="1" step="0.05" value="1">
+        </label>
+        <label class="volumen" id="sala-control-micro" hidden><span class="volumen__nombre">Micrófono</span>
+          <input id="sala-vol-micro" type="range" min="0" max="1" step="0.05" value="1">
         </label>
         <label class="calidad"><span class="calidad__nombre">Calidad</span>
           <select id="sala-calidad">

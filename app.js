@@ -48,7 +48,8 @@ function aSlug(texto) {
 }
 
 function limpiarNombre(texto) {
-  const limpio = String(texto || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 20);
+  if (typeof texto !== 'string') return 'Alguien';
+  const limpio = texto.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 20);
   return limpio || 'Alguien';
 }
 
@@ -170,8 +171,11 @@ function iniciarCabina(sala) {
   const btnCortar = $('btn-cortar');
 
   const espectadores = new Map(); // peerId -> { conn, nombre, llamada, demora }
-  let stream = null;
+  let captura = null; // lo que da getDisplayMedia
+  let stream = null; // lo que se manda: video de la captura + audio mezclado
   let peer = null;
+  const btnMicro = $('btn-micro');
+  let microActivo = false;
   let intentosId = 0;
   let calidad = CALIDADES[guardado.leer('calidad', 'normal')] ? guardado.leer('calidad', 'normal') : 'normal';
   let contenido = guardado.leer('contenido', 'movimiento') === 'texto' ? 'texto' : 'movimiento';
@@ -207,6 +211,8 @@ function iniciarCabina(sala) {
 
     peer.on('connection', (conn) => {
       conn.on('open', () => {
+        const previo = espectadores.get(conn.peer);
+        if (previo && previo.conn !== conn) { previo.llamada?.close(); previo.conn.close(); }
         const pedida = conn.metadata?.vista;
         const vista = typeof pedida === 'string' && Object.hasOwn(VISTAS, pedida) ? pedida : 'auto';
         espectadores.set(conn.peer, { conn, nombre: limpiarNombre(conn.metadata?.nombre), llamada: null, demora: null, vista });
@@ -215,7 +221,7 @@ function iniciarCabina(sala) {
       });
       conn.on('data', (msg) => {
         const e = espectadores.get(conn.peer);
-        if (!e || !msg || typeof msg !== 'object') return;
+        if (!e || e.conn !== conn || !msg || typeof msg !== 'object') return;
         if (msg.tipo === 'demora' && Number.isFinite(msg.ms)) {
           e.demora = Math.max(0, Math.min(99999, Math.round(msg.ms)));
           dibujarFila();
@@ -228,13 +234,13 @@ function iniciarCabina(sala) {
           llamar(conn.peer);
         }
       });
-      conn.on('close', () => quitar(conn.peer));
-      conn.on('error', () => quitar(conn.peer));
+      conn.on('close', () => quitar(conn));
+      conn.on('error', () => quitar(conn));
     });
 
     peer.on('disconnected', () => {
       // Se cayó el servidor de salas; las conexiones P2P siguen. Reconectar para recibir gente nueva.
-      setTimeout(() => { if (peer && !peer.destroyed && peer.disconnected) peer.reconnect(); }, 2000);
+      recuperar(peer);
     });
 
     peer.on('error', (err) => {
@@ -249,18 +255,29 @@ function iniciarCabina(sala) {
         }
       } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
         if (!stream) aviso('No hay conexión con el servidor de salas', 'Revisá tu internet. Se reintenta solo.', false);
-        if (peer.destroyed) setTimeout(conectar, 4000);
+        recuperar(peer);
       } else if (err.type === 'browser-incompatible') {
         aviso('Este navegador no sirve para transmitir', 'Probá con Chrome, Edge o Firefox actualizados.', false);
       }
     });
   }
 
-  function quitar(id) {
-    const e = espectadores.get(id);
-    if (!e) return;
+  // PeerJS emite 'error' antes de destruir el peer: decidir un rato después qué hace falta.
+  let temporizadorRecuperar = null;
+  function recuperar(fallido) {
+    clearTimeout(temporizadorRecuperar);
+    temporizadorRecuperar = setTimeout(() => {
+      if (peer !== fallido) return;
+      if (fallido.destroyed) conectar();
+      else if (fallido.disconnected) fallido.reconnect();
+    }, 3000);
+  }
+
+  function quitar(conn) {
+    const e = espectadores.get(conn.peer);
+    if (!e || e.conn !== conn) return;
     e.llamada?.close();
-    espectadores.delete(id);
+    espectadores.delete(conn.peer);
     difundir();
   }
 
@@ -272,7 +289,11 @@ function iniciarCabina(sala) {
     if (!llamada) return;
     e.llamada = llamada;
     const pc = llamada.peerConnection;
-    if (pc) iceDirecto(pc, (estado) => { if (estado === 'connected') codificar(pc, e); });
+    if (pc) {
+      iceDirecto(pc, (estado) => {
+        if (estado === 'connected') { codificar(pc, e); contarPistas(e, pc); }
+      });
+    }
     llamada.on('close', () => { if (e.llamada === llamada) e.llamada = null; });
     llamada.on('error', () => { if (e.llamada === llamada) e.llamada = null; });
   }
@@ -296,24 +317,101 @@ function iniciarCabina(sala) {
     }
   }
 
-  function aplicarATodos() {
+  async function aplicarATodos() {
     if (!stream) return;
     const c = CALIDADES[calidad];
     const pista = stream.getVideoTracks()[0];
     if (pista) {
       pista.contentHint = contenido === 'texto' ? 'detail' : 'motion';
-      pista.applyConstraints({ width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } }).catch(() => {});
+      // Esperar: la escala de cada butaca se calcula con la altura nueva de la fuente.
+      await pista.applyConstraints({ width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } }).catch(() => {});
     }
+    if (!stream) return;
     for (const e of espectadores.values()) {
       const pc = e.llamada?.peerConnection;
       if (pc && pc.connectionState === 'connected') codificar(pc, e);
     }
   }
 
+  // Audio en dos pistas separadas, siempre en este orden: pantalla y micrófono.
+  // Si falta una fuente viaja una pista muda en su lugar: prender o apagar el micrófono
+  // es un replaceTrack sin renegociar, y cada butaca regula cada volumen por separado.
+  let audio = null; // { ctx, pantalla, micro, mudaMicro, microReal }
+
+  function pistaMuda(ctx) {
+    return ctx.createMediaStreamDestination().stream.getAudioTracks()[0];
+  }
+
+  async function reemplazarMicro(nueva) {
+    const vieja = audio.micro;
+    if (vieja === nueva) return;
+    audio.micro = nueva;
+    // Quitar y volver a sumar deja el micrófono último, después de la pantalla.
+    stream.removeTrack(vieja);
+    stream.addTrack(nueva);
+    const cambios = [];
+    for (const e of espectadores.values()) {
+      for (const sender of e.llamada?.peerConnection?.getSenders() || []) {
+        if (sender.track === vieja) cambios.push(sender.replaceTrack(nueva).catch(() => {}));
+      }
+    }
+    await Promise.all(cambios);
+  }
+
+  async function conectarMicro() {
+    if (!audio || audio.microReal) return true;
+    let micro;
+    try {
+      micro = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch {
+      return false;
+    }
+    const pista = micro.getAudioTracks()[0];
+    if (!audio || audio.microReal || !microActivo) { pista.stop(); return !!audio?.microReal; }
+    audio.microReal = pista;
+    await reemplazarMicro(pista);
+    difundir();
+    return true;
+  }
+
+  async function desconectarMicro() {
+    if (!audio?.microReal) return;
+    const real = audio.microReal;
+    audio.microReal = null;
+    await reemplazarMicro(audio.mudaMicro);
+    real.stop();
+    difundir();
+  }
+
+  // Avisarle a la butaca qué pista es cuál (por mid, que es igual en las dos puntas).
+  function contarPistas(e, pc) {
+    if (!audio || !e.conn.open) return;
+    const mid = (pista) => pc.getTransceivers().find((t) => t.sender.track === pista)?.mid ?? null;
+    e.conn.send({ tipo: 'pistas', pantalla: mid(audio.pantalla), micro: mid(audio.micro) });
+  }
+
+  function contarSonido() {
+    const nota = $('cabina-sonido');
+    if (!stream) {
+      nota.textContent = microActivo ? 'El micrófono se suma apenas compartas la pantalla.' : '';
+      return;
+    }
+    const pantalla = captura.getAudioTracks().length > 0;
+    const micro = !!audio?.microReal;
+    if (pantalla && micro) nota.textContent = 'Se escuchan la pantalla y tu micrófono, por separado: cada butaca regula cada volumen. Usá auriculares para que no se acople.';
+    else if (pantalla) nota.textContent = 'Se escucha el sonido de la pantalla.';
+    else if (micro) nota.textContent = 'Se escucha sólo tu micrófono. Para sumar el sonido de la pantalla, volvé a compartir eligiendo una pestaña (o la pantalla completa en Windows) con "Compartir audio" activado.';
+    else nota.textContent = 'Sin sonido. Para sumar el de la pantalla, volvé a compartir eligiendo una pestaña (o la pantalla completa en Windows) con "Compartir audio" activado.';
+  }
+
   async function compartir() {
     const c = CALIDADES[calidad];
+    // El AudioContext (para las pistas mudas) se crea dentro del clic.
+    const ctx = new AudioContext();
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
+      captura = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } },
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
         systemAudio: 'include',
@@ -321,46 +419,77 @@ function iniciarCabina(sala) {
         surfaceSwitching: 'include',
       });
     } catch (err) {
-      stream = null;
+      ctx.close();
+      captura = null;
       if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
         aviso('No se pudo compartir la pantalla', 'El navegador no dio permiso. Probá de nuevo o reiniciá el navegador.', true);
       }
       return;
     }
-    const pista = stream.getVideoTracks()[0];
+    const pista = captura.getVideoTracks()[0];
     pista.addEventListener('ended', cortar);
-    aplicarATodos();
-    video.srcObject = stream;
+    const mudaMicro = pistaMuda(ctx);
+    audio = { ctx, pantalla: captura.getAudioTracks()[0] || pistaMuda(ctx), micro: mudaMicro, mudaMicro, microReal: null };
+    stream = new MediaStream([pista, audio.pantalla, audio.micro]);
+    if (microActivo && !(await conectarMicro())) marcarMicro(false);
+    if (!stream) return; // se cortó mientras se pedía el micrófono
+    await aplicarATodos();
+    video.srcObject = new MediaStream([pista]);
     video.dataset.activo = '';
     $('cabina-aviso').hidden = true;
     btnCortar.hidden = false;
     ponerAire('cabina', true);
-    const sonido = $('cabina-sonido');
-    sonido.textContent = stream.getAudioTracks().length
-      ? 'Con sonido: tu audio también se transmite.'
-      : 'Sin sonido. Para mandar audio, elegí una pestaña (o la pantalla completa en Windows) y activá "Compartir audio".';
+    contarSonido();
     for (const id of espectadores.keys()) llamar(id);
     difundir();
   }
 
   function cortar() {
     if (!stream) return;
-    for (const pista of stream.getTracks()) pista.stop();
+    for (const pista of captura.getTracks()) pista.stop();
+    audio.microReal?.stop();
+    audio.ctx.close();
+    audio = null;
+    captura = null;
     stream = null;
     for (const e of espectadores.values()) { e.llamada?.close(); e.llamada = null; }
     video.srcObject = null;
     delete video.dataset.activo;
     btnCortar.hidden = true;
-    $('cabina-sonido').textContent = '';
+    contarSonido();
     ponerAire('cabina', false);
     aviso('Transmisión cortada', 'Tus amigos siguen en la sala. Cuando vuelvas a compartir, la imagen les aparece sola.', true);
     difundir();
   }
 
+  function marcarMicro(activo) {
+    microActivo = activo;
+    guardado.escribir('micro', activo ? '1' : '0');
+    btnMicro.setAttribute('aria-pressed', String(activo));
+    btnMicro.textContent = activo ? 'Apagar micrófono' : 'Activar micrófono';
+  }
+
+  btnMicro.addEventListener('click', async () => {
+    if (microActivo) {
+      marcarMicro(false);
+      await desconectarMicro();
+    } else {
+      marcarMicro(true);
+      if (stream && !(await conectarMicro())) {
+        marcarMicro(false);
+        $('cabina-sonido').textContent = 'El navegador no dio permiso para usar el micrófono. Habilitalo en el candado de la barra de direcciones.';
+        return;
+      }
+    }
+    contarSonido();
+  });
+
   function difundir() {
     const estado = {
       tipo: 'estado',
       enVivo: !!stream,
+      sonidoPantalla: !!captura?.getAudioTracks().length,
+      microfono: !!audio?.microReal,
       espectadores: [...espectadores.values()].map((e) => e.nombre),
     };
     for (const e of espectadores.values()) {
@@ -466,6 +595,8 @@ function iniciarCabina(sala) {
   });
   window.addEventListener('pagehide', () => peer?.destroy());
 
+  marcarMicro(guardado.leer('micro', '0') === '1');
+  contarSonido();
   dibujarFila();
   conectar();
 }
@@ -496,13 +627,17 @@ function mirar(sala, nombre) {
   const pantalla = $('sala-pantalla');
   const btnSonido = $('btn-sonido');
   const btnMute = $('btn-mute');
-  const volumen = $('sala-volumen');
+  // Pantalla y micrófono llegan en pistas separadas: un elemento de audio y un volumen para cada una.
+  const sonidos = { pantalla: new Audio(), micro: new Audio() };
+  const volumenes = { pantalla: $('sala-vol-pantalla'), micro: $('sala-vol-micro') };
   const demoraEl = $('sala-demora');
   const selVista = $('sala-calidad');
 
   let peer = null;
   let conn = null;
   let llamada = null;
+  let recibido = null;
+  let mids = null; // qué mid es la pantalla y cuál el micrófono, según la cabina
   let enVivo = false;
   let reintento = null;
   let vigiaImagen = null;
@@ -517,13 +652,31 @@ function mirar(sala, nombre) {
     if (conn?.open) conn.send({ tipo: 'vista', valor: vista });
   });
 
-  video.volume = Number(guardado.leer('volumen', '1')) || 1;
-  volumen.value = video.volume;
+  for (const [clave, el] of Object.entries(sonidos)) {
+    el.autoplay = true;
+    const guardadoVol = Number(guardado.leer('volumen-' + clave, '1'));
+    el.volume = Number.isFinite(guardadoVol) ? Math.min(1, Math.max(0, guardadoVol)) : 1;
+    volumenes[clave].value = el.volume;
+    volumenes[clave].addEventListener('input', () => {
+      el.volume = Number(volumenes[clave].value);
+      guardado.escribir('volumen-' + clave, volumenes[clave].value);
+    });
+  }
 
   function aviso(titulo, texto) {
     $('sala-aviso').hidden = false;
     $('sala-aviso-titulo').textContent = titulo;
     $('sala-aviso-texto').textContent = texto;
+  }
+
+  let temporizadorRecuperar = null;
+  function recuperar(fallido) {
+    clearTimeout(temporizadorRecuperar);
+    temporizadorRecuperar = setTimeout(() => {
+      if (peer !== fallido) return;
+      if (fallido.destroyed) conectar();
+      else if (fallido.disconnected) fallido.reconnect();
+    }, 3000);
   }
 
   function reintentar(ms) {
@@ -532,7 +685,9 @@ function mirar(sala, nombre) {
   }
 
   function apagarPantalla() {
+    recibido = null;
     video.srcObject = null;
+    for (const el of Object.values(sonidos)) el.srcObject = null;
     delete video.dataset.activo;
     demoraEl.textContent = '';
     btnSonido.hidden = true;
@@ -543,16 +698,14 @@ function mirar(sala, nombre) {
     peer = new Peer({ debug: 1 });
     peer.on('open', conectarCabina);
     peer.on('call', atender);
-    peer.on('disconnected', () => {
-      setTimeout(() => { if (peer && !peer.destroyed && peer.disconnected) peer.reconnect(); }, 2000);
-    });
+    peer.on('disconnected', () => recuperar(peer));
     peer.on('error', (err) => {
       if (err.type === 'peer-unavailable') {
         if (!enVivo) aviso('La cabina está cerrada', 'Cuando empiece la transmisión en esta sala, la imagen aparece sola. No hace falta recargar.');
         reintentar(4000);
       } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
         if (!enVivo) aviso('No hay conexión con el servidor de salas', 'Revisá tu internet. Se reintenta solo.');
-        if (peer.destroyed) setTimeout(conectar, 4000);
+        recuperar(peer);
       } else if (err.type === 'browser-incompatible') {
         aviso('Este navegador no puede mostrar la transmisión', 'Probá con Chrome, Edge, Firefox o Safari actualizados.');
       }
@@ -572,7 +725,15 @@ function mirar(sala, nombre) {
       if (!enVivo) aviso('La función todavía no empezó', 'Ya estás en tu butaca. La pantalla se enciende cuando empiece la transmisión.');
     });
     actual.on('data', (msg) => {
-      if (conn !== actual || !msg || msg.tipo !== 'estado') return;
+      if (conn !== actual || !msg) return;
+      if (msg.tipo === 'pistas') {
+        mids = { pantalla: typeof msg.pantalla === 'string' ? msg.pantalla : null, micro: typeof msg.micro === 'string' ? msg.micro : null };
+        if (llamada?.peerConnection && recibido) asignarAudio(llamada.peerConnection);
+        return;
+      }
+      if (msg.tipo !== 'estado') return;
+      $('sala-control-micro').hidden = !msg.microfono;
+      $('sala-control-pantalla').hidden = !msg.sonidoPantalla;
       const n = Array.isArray(msg.espectadores) ? msg.espectadores.length : 0;
       $('sala-cuenta').textContent = n === 1 ? '1 mirando' : n + ' mirando';
       enVivo = !!msg.enVivo;
@@ -611,19 +772,24 @@ function mirar(sala, nombre) {
   }
 
   function atender(nueva) {
+    // Sólo se atiende a la cabina de esta sala.
+    if (nueva.peer !== PREFIJO + sala) { nueva.close(); return; }
     llamada?.close();
     llamada = nueva;
+    mids = null;
     nueva.answer();
     const pc = nueva.peerConnection;
     nueva.on('stream', (s) => {
       // PeerJS avisa una vez por pista (video y audio): reproducir una sola vez.
-      if (llamada !== nueva || video.srcObject === s) return;
+      if (llamada !== nueva || recibido === s) return;
+      recibido = s;
       // Demora mínima: sin colchón extra en el buffer de jitter.
       for (const r of pc.getReceivers()) {
         if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
         else if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
       }
-      video.srcObject = s;
+      video.srcObject = new MediaStream(s.getVideoTracks());
+      asignarAudio(pc);
       video.dataset.activo = '';
       $('sala-aviso').hidden = true;
       clearTimeout(vigiaImagen);
@@ -642,24 +808,43 @@ function mirar(sala, nombre) {
     }
   }
 
+  // Ubica cada pista de audio por el mid que mandó la cabina; si todavía no llegó, por orden (pantalla, micrófono).
+  function asignarAudio(pc) {
+    const audios = pc.getTransceivers().filter((t) => t.receiver.track?.kind === 'audio');
+    const porMid = (mid) => (mid ? audios.find((t) => t.mid === mid)?.receiver.track : null);
+    const pistas = {
+      pantalla: porMid(mids?.pantalla) || audios[0]?.receiver.track,
+      micro: porMid(mids?.micro) || audios[1]?.receiver.track,
+    };
+    for (const [clave, el] of Object.entries(sonidos)) {
+      const pista = pistas[clave];
+      if (!pista) { el.srcObject = null; continue; }
+      if (el.srcObject?.getAudioTracks()[0] === pista) continue;
+      el.srcObject = new MediaStream([pista]);
+      el.play().catch(() => {});
+    }
+  }
+
+  function sonar() {
+    return Promise.all(Object.values(sonidos).filter((el) => el.srcObject).map((el) => el.play()));
+  }
+
   function marcarMudo(mudo) {
-    video.muted = mudo;
+    for (const el of Object.values(sonidos)) el.muted = mudo;
     btnMute.setAttribute('aria-pressed', String(mudo));
     btnMute.textContent = mudo ? 'Activar sonido' : 'Silenciar';
   }
 
   async function reproducir() {
-    const elegido = guardado.leer('mudo', '0') === '1';
-    video.muted = elegido;
+    marcarMudo(guardado.leer('mudo', '0') === '1');
+    video.muted = true; // el video va sin audio: el sonido sale por los elementos de audio
+    video.play().catch(() => {});
     try {
-      await video.play();
-      marcarMudo(elegido);
+      await sonar();
       btnSonido.hidden = true;
     } catch {
-      // El navegador no dejó arrancar con sonido: arrancar mudo y ofrecer el botón.
-      marcarMudo(true);
+      // El navegador no dejó arrancar con sonido: mostrar el botón para habilitarlo.
       btnSonido.hidden = false;
-      video.play().catch(() => {});
     }
   }
 
@@ -680,17 +865,15 @@ function mirar(sala, nombre) {
   btnSonido.addEventListener('click', () => {
     marcarMudo(false);
     guardado.escribir('mudo', '0');
-    btnSonido.hidden = true;
+    // Reproducir dentro del clic: así lo habilitan todos los navegadores, Safari incluido.
+    video.play().catch(() => {});
+    sonar().then(() => { btnSonido.hidden = true; }, () => { btnSonido.hidden = false; });
   });
   btnMute.addEventListener('click', () => {
-    const silenciar = !video.muted;
+    const silenciar = !sonidos.pantalla.muted;
     marcarMudo(silenciar);
     guardado.escribir('mudo', silenciar ? '1' : '0');
-    if (!silenciar) btnSonido.hidden = true;
-  });
-  volumen.addEventListener('input', () => {
-    video.volume = Number(volumen.value);
-    guardado.escribir('volumen', volumen.value);
+    if (!silenciar) sonar().then(() => { btnSonido.hidden = true; }, () => {});
   });
 
   function pantallaCompleta() {
