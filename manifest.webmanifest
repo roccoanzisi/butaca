@@ -1,0 +1,12 @@
+{
+  "name": "Butaca",
+  "short_name": "Butaca",
+  "description": "Una persona comparte su pantalla en vivo, el resto mira.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#1C0C12",
+  "theme_color": "#1C0C12",
+  "icons": [
+    { "src": "icono.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

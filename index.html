@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Butaca</title>
+  <meta name="description" content="Una persona comparte su pantalla en vivo, el resto mira. Sin cuentas ni instalar nada.">
+  <meta name="theme-color" content="#1C0C12">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="icono.png" type="image/png">
+  <link rel="apple-touch-icon" href="icono.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anybody:wdth,wght@50..150,400..900&family=Familjen+Grotesk:wght@400..700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="butaca" viewBox="0 0 40 40">
+      <path d="M9 21V9a6 6 0 0 1 6-6h10a6 6 0 0 1 6 6v12z"/>
+      <path d="M5 18a2 2 0 0 1 2-2h1a2 2 0 0 1 2 2v12H5zM30 18a2 2 0 0 1 2-2h1a2 2 0 0 1 2 2v12h-5z"/>
+      <path d="M8 22h24v8H8z"/>
+      <path d="M8 31h4v6H8zM28 31h4v6h-4z"/>
+    </symbol>
+  </svg>
+
+  <!-- Inicio -->
+  <main id="vista-inicio" class="vista inicio" hidden>
+    <h1 class="letrero letrero--grande" data-letrero="Butaca"><span class="sr">Butaca</span></h1>
+    <p class="inicio__bajada">Una persona comparte su pantalla en vivo. El resto mira, con la menor demora posible. Sin cuentas ni instalar nada.</p>
+    <form id="form-inicio" class="inicio__form" autocomplete="off">
+      <label class="campo">
+        <span class="campo__nombre">Nombre de la sala</span>
+        <input id="inicio-sala" name="sala" type="text" maxlength="32" placeholder="los-viernes" required
+               pattern=".*[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü].*" spellcheck="false">
+      </label>
+      <div class="inicio__acciones">
+        <button class="boton boton--principal" type="submit" name="modo" value="sala">Mirar</button>
+        <button class="boton" type="submit" name="modo" value="cabina">Transmitir desde acá</button>
+      </div>
+    </form>
+  </main>
+
+  <!-- Cabina: quien transmite -->
+  <main id="vista-cabina" class="vista cabina" hidden>
+    <header class="barra">
+      <a class="barra__marca" href="./" aria-label="Volver al inicio">Butaca</a>
+      <div class="letrero letrero--chico" id="cabina-letrero"></div>
+      <span class="aire" id="cabina-aire" data-estado="apagado"><span class="aire__luz"></span><span id="cabina-aire-texto">Fuera del aire</span></span>
+    </header>
+
+    <div class="cabina__cuerpo">
+      <section class="pantalla" aria-label="Lo que se está transmitiendo">
+        <video id="cabina-video" class="pantalla__video" muted playsinline autoplay></video>
+        <div class="pantalla__aviso" id="cabina-aviso">
+          <p class="pantalla__titulo" id="cabina-aviso-titulo">Conectando la cabina</p>
+          <p class="pantalla__texto" id="cabina-aviso-texto">Un momento.</p>
+          <button class="boton boton--principal" id="btn-compartir" type="button" hidden>Compartir pantalla</button>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="panel__bloque">
+          <h2 class="panel__titulo">Link para tus amigos</h2>
+          <div class="link">
+            <input id="cabina-link" class="link__texto" type="text" readonly aria-label="Link de la sala">
+            <button class="boton boton--chico" id="btn-copiar" type="button">Copiar</button>
+          </div>
+        </div>
+
+        <div class="panel__bloque">
+          <h2 class="panel__titulo" id="lbl-calidad">Calidad</h2>
+          <div class="segmentos" role="radiogroup" aria-labelledby="lbl-calidad" id="sel-calidad">
+            <button type="button" role="radio" data-valor="liviana">720p 30</button>
+            <button type="button" role="radio" data-valor="normal">1080p 30</button>
+            <button type="button" role="radio" data-valor="alta">1080p 60</button>
+          </div>
+          <h2 class="panel__titulo" id="lbl-contenido">Qué vas a mostrar</h2>
+          <div class="segmentos" role="radiogroup" aria-labelledby="lbl-contenido" id="sel-contenido">
+            <button type="button" role="radio" data-valor="movimiento">Juego o video</button>
+            <button type="button" role="radio" data-valor="texto">Texto o código</button>
+          </div>
+          <p class="panel__nota" id="cabina-nota-contenido"></p>
+        </div>
+
+        <div class="panel__bloque">
+          <h2 class="panel__titulo">En las butacas <span class="panel__cuenta" id="cabina-cuenta">0</span></h2>
+          <ul class="fila" id="cabina-fila"></ul>
+          <p class="panel__nota" id="cabina-subida"></p>
+        </div>
+
+        <div class="panel__bloque panel__bloque--pie">
+          <p class="panel__nota" id="cabina-sonido"></p>
+          <button class="boton boton--peligro" id="btn-cortar" type="button" hidden>Cortar transmisión</button>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <!-- Sala: quien mira -->
+  <main id="vista-sala" class="vista sala" hidden>
+    <form id="form-entrada" class="entrada" autocomplete="off">
+      <div class="letrero letrero--grande" id="entrada-letrero"></div>
+      <label class="campo">
+        <span class="campo__nombre">Tu nombre</span>
+        <input id="entrada-nombre" type="text" maxlength="20" placeholder="Cómo te ven en la sala" required>
+      </label>
+      <button class="boton boton--principal" type="submit">Entrar a la sala</button>
+      <p class="entrada__nota">Quien transmite ve tu nombre en su fila de butacas.</p>
+    </form>
+
+    <div class="sala__escenario" id="sala-escenario" hidden>
+      <header class="barra">
+        <a class="barra__marca" href="./" aria-label="Salir al inicio">Butaca</a>
+        <div class="letrero letrero--chico" id="sala-letrero"></div>
+        <span class="aire" id="sala-aire" data-estado="apagado"><span class="aire__luz"></span><span id="sala-aire-texto">Fuera del aire</span></span>
+        <span class="barra__dato" id="sala-cuenta"></span>
+      </header>
+
+      <section class="pantalla pantalla--sala" id="sala-pantalla" aria-label="Transmisión">
+        <video id="sala-video" class="pantalla__video" playsinline autoplay></video>
+        <div class="pantalla__aviso" id="sala-aviso">
+          <p class="pantalla__titulo" id="sala-aviso-titulo">Buscando la sala</p>
+          <p class="pantalla__texto" id="sala-aviso-texto">Un momento.</p>
+        </div>
+        <button class="boton boton--principal pantalla__sonido" id="btn-sonido" type="button" hidden>Activar sonido</button>
+      </section>
+
+      <footer class="controles">
+        <button class="boton boton--chico" id="btn-mute" type="button" aria-pressed="false">Silenciar</button>
+        <label class="volumen"><span class="sr">Volumen</span>
+          <input id="sala-volumen" type="range" min="0" max="1" step="0.05" value="1">
+        </label>
+        <label class="calidad"><span class="calidad__nombre">Calidad</span>
+          <select id="sala-calidad">
+            <option value="auto">Auto (la de la cabina)</option>
+            <option value="720">720p</option>
+            <option value="480">480p, conexión floja</option>
+            <option value="360">360p, conexión muy floja</option>
+          </select>
+        </label>
+        <span class="controles__demora" id="sala-demora" title="Tiempo entre lo que pasa en la pantalla de quien transmite y lo que ves vos"></span>
+        <button class="boton boton--chico" id="btn-completa" type="button">Pantalla completa</button>
+      </footer>
+    </div>
+  </main>
+
+  <script src="vendor/peerjs-1.5.4.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
