@@ -81,6 +81,9 @@ function salaLegible(slug) {
 }
 
 function ponerAire(prefijo, encendido) {
+  // También en el título: se ve en la barra de tareas con la pestaña minimizada.
+  const titulo = document.title.replace(/^\(En vivo\) /, '');
+  document.title = encendido ? '(En vivo) ' + titulo : titulo;
   $(prefijo + '-aire').dataset.estado = encendido ? 'encendido' : 'apagado';
   $(prefijo + '-aire-texto').textContent = encendido ? 'En vivo' : 'Fuera del aire';
 }
@@ -206,7 +209,7 @@ function iniciarCabina(sala) {
 
     peer.on('open', () => {
       intentosId = 0;
-      if (!stream) aviso('La cabina está lista', 'Compartí tu pantalla cuando quieras. Quien tenga el link la ve al instante.', true);
+      if (!stream) aviso('La cabina está lista', 'Elegí la pantalla entera, una ventana o una pestaña. Quien tenga el link la ve al instante.', true);
     });
 
     peer.on('connection', (conn) => {
@@ -412,9 +415,11 @@ function iniciarCabina(sala) {
     const ctx = new AudioContext();
     try {
       captura = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } },
+        // Abre el selector en "Toda la pantalla"; ventanas y pestañas siguen disponibles.
+        video: { displaySurface: 'monitor', width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } },
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
         systemAudio: 'include',
+        monitorTypeSurfaces: 'include',
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'include',
       });
@@ -426,19 +431,22 @@ function iniciarCabina(sala) {
       }
       return;
     }
+    const mia = captura;
     const pista = captura.getVideoTracks()[0];
     pista.addEventListener('ended', cortar);
     const mudaMicro = pistaMuda(ctx);
     audio = { ctx, pantalla: captura.getAudioTracks()[0] || pistaMuda(ctx), micro: mudaMicro, mudaMicro, microReal: null };
     stream = new MediaStream([pista, audio.pantalla, audio.micro]);
-    if (microActivo && !(await conectarMicro())) marcarMicro(false);
-    if (!stream) return; // se cortó mientras se pedía el micrófono
+    if (microActivo && !(await operarMicro(conectarMicro))) marcarMicro(false);
+    if (captura !== mia) return; // se cortó mientras se pedía el micrófono
     await aplicarATodos();
+    if (captura !== mia) return; // se cortó mientras se ajustaba la calidad
     video.srcObject = new MediaStream([pista]);
     video.dataset.activo = '';
     $('cabina-aviso').hidden = true;
     btnCortar.hidden = false;
     ponerAire('cabina', true);
+    $('cabina-minimizar').hidden = false;
     contarSonido();
     for (const id of espectadores.keys()) llamar(id);
     difundir();
@@ -456,10 +464,24 @@ function iniciarCabina(sala) {
     video.srcObject = null;
     delete video.dataset.activo;
     btnCortar.hidden = true;
+    $('cabina-minimizar').hidden = true;
     contarSonido();
     ponerAire('cabina', false);
     aviso('Transmisión cortada', 'Tus amigos siguen en la sala. Cuando vuelvas a compartir, la imagen les aparece sola.', true);
     difundir();
+  }
+
+  // Prender y apagar el micrófono va de a una operación: cada replaceTrack
+  // termina antes de que empiece la siguiente, así ningún sender queda con la pista vieja.
+  let colaMicro = Promise.resolve();
+  let pendientesMicro = 0;
+  function operarMicro(operacion) {
+    pendientesMicro++;
+    btnMicro.disabled = true;
+    const hecho = colaMicro.then(operacion, operacion);
+    colaMicro = hecho.catch(() => {});
+    colaMicro.then(() => { if (--pendientesMicro === 0) btnMicro.disabled = false; });
+    return hecho;
   }
 
   function marcarMicro(activo) {
@@ -472,10 +494,10 @@ function iniciarCabina(sala) {
   btnMicro.addEventListener('click', async () => {
     if (microActivo) {
       marcarMicro(false);
-      await desconectarMicro();
+      await operarMicro(desconectarMicro);
     } else {
       marcarMicro(true);
-      if (stream && !(await conectarMicro())) {
+      if (stream && !(await operarMicro(conectarMicro))) {
         marcarMicro(false);
         $('cabina-sonido').textContent = 'El navegador no dio permiso para usar el micrófono. Habilitalo en el candado de la barra de direcciones.';
         return;

@@ -14,6 +14,8 @@ la marquesina de letras sueltas, la linterna ámbar del acomodador y la luz roja
   (si falta red, baja nitidez antes que sumar demora).
 - Bitrate con techo por calidad para no saturar la subida (la congestión se paga en demora).
 - La demora medida (`getStats`) se muestra siempre, en la butaca y en la cabina.
+- Audio sin mezclar: pantalla y micrófono viajan en pistas separadas (sin WebAudio en el camino).
+- Cada butaca elige su tope de calidad; la cabina lo aplica sólo a esa copia (`scaleResolutionDownBy`).
 
 ## Color
 
@@ -48,7 +50,8 @@ cada ficha levemente torcida como colocada a mano. Al cargar, las fichas se colo
 - **Cabina**: pantalla grande con la vista previa; columna con link para compartir, calidad,
   tipo de contenido, sonido, fila de butacas (una por persona conectada, con su nombre) y la subida necesaria.
 - **Sala**: entrada (nombre + "Entrar", el clic habilita el sonido), luego la pantalla ocupa todo;
-  barra mínima con letrero chico, luz al aire, cantidad mirando, demora, volumen y pantalla completa.
+  barra mínima con letrero chico, luz al aire, cantidad mirando, demora, volumen de pantalla y de micrófono
+  por separado, calidad propia y pantalla completa.
 
 La fila de butacas es información, no decoración: butaca encendida = persona conectada.
 
