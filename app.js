@@ -37,6 +37,17 @@ const NOTAS_CONTENIDO = {
 
 const $ = (id) => document.getElementById(id);
 
+// Clave privada de la cabina de una sala, guardada en esta compu. No viaja en el link de los amigos:
+// así nadie con el link puede adueñarse de la cabina.
+function claveCabina(sala) {
+  let clave = guardado.leer('clave:' + sala, '');
+  if (!/^[A-Za-z0-9-]{16,64}$/.test(clave)) {
+    clave = crypto.randomUUID();
+    guardado.escribir('clave:' + sala, clave);
+  }
+  return clave;
+}
+
 function urlServidor(sala, params) {
   const base = new URLSearchParams(location.search).get('servidor') || SERVIDOR;
   return `${base.replace(/\/$/, '')}/sala/${encodeURIComponent(sala)}?${new URLSearchParams(params)}`;
@@ -78,8 +89,8 @@ class Canal {
       for (const p of this.pendientes.values()) p.rechazar(new Error('Se cortó la conexión con el servidor.'));
       this.pendientes.clear();
       this.emitir('cerrado', ev);
-      // 4001 (cabina ocupada) y 4002 (sala llena) los decide quien usa el canal.
-      if (!this.terminado && ev.code !== 4001 && ev.code !== 4002) this.reintentar();
+      // 4001 (cabina ocupada), 4002 (sala llena) y 4003 (cabina de otra compu) los decide quien usa el canal.
+      if (!this.terminado && ![4001, 4002, 4003].includes(ev.code)) this.reintentar();
     };
   }
 
@@ -104,7 +115,7 @@ class Canal {
       this.enviar({ tipo: 'pedido', reqId, accion, datos });
       setTimeout(() => {
         if (this.pendientes.delete(reqId)) rechazar(new Error('El servidor no respondió a tiempo.'));
-      }, 20000);
+      }, 30000);
     });
   }
 
@@ -333,7 +344,7 @@ function iniciarCabina(sala) {
 
   function conectar() {
     aviso('Conectando la cabina', 'Un momento.', false);
-    canal = new Canal(urlServidor(sala, { rol: 'cabina' }));
+    canal = new Canal(urlServidor(sala, { rol: 'cabina', clave: claveCabina(sala) }));
     canal.on('bienvenida', (msg) => {
       ice = msg.ice;
       intentosOcupada = 0;
@@ -368,7 +379,15 @@ function iniciarCabina(sala) {
       dibujarFila();
     });
     canal.on('cerrado', (ev) => {
-      if (ev.code === 4001) {
+      if (stream) {
+        // El servidor olvida la publicación al cortarse: avisar hasta volver a publicar.
+        ponerAire('cabina', false);
+        $('cabina-alerta').textContent = 'Se cortó la conexión con el servidor. Reconectando sola…';
+      }
+      if (ev.code === 4003) {
+        aviso('Esta sala la abrió otra compu',
+          'Si fuiste vos desde otro navegador o desde la app, esperá 30 minutos sin transmitir allá o elegí otro nombre de sala.', false);
+      } else if (ev.code === 4001) {
         // Al recargar, el servidor puede tardar unos segundos en soltar la cabina anterior.
         if (++intentosOcupada <= 4) {
           aviso('Conectando la cabina', 'Recuperando la sala…', false);
@@ -383,10 +402,11 @@ function iniciarCabina(sala) {
   }
 
   // Publica la captura en el SFU: una conexión, video en tres capas y dos audios separados.
-  let publicando = null;
+  let publicando = Promise.resolve();
   function publicar() {
-    if (!publicando) publicando = publicarAhora().finally(() => { publicando = null; });
-    return publicando;
+    const hecho = publicando.catch(() => {}).then(publicarAhora);
+    publicando = hecho;
+    return hecho;
   }
 
   async function publicarAhora() {
@@ -408,6 +428,7 @@ function iniciarCabina(sala) {
     await nueva.setLocalDescription(await nueva.createOffer());
     const { sdp } = await canal.pedido('publicar', {
       sdp: nueva.localDescription.sdp,
+      sonido: { pantalla: !!captura?.getAudioTracks().length, micro: !!audio?.microReal },
       pistas: [
         { mid: transceptores.video.mid, trackName: 'video' },
         { mid: transceptores.pantalla.mid, trackName: 'pantalla' },
@@ -419,6 +440,10 @@ function iniciarCabina(sala) {
     ajustarVideo();
     avisarSonido();
     $('cabina-alerta').textContent = '';
+    if (stream) {
+      ponerAire('cabina', true);
+      $('cabina-aviso').hidden = true;
+    }
   }
 
   function errorPublicar(err) {
@@ -475,8 +500,14 @@ function iniciarCabina(sala) {
   // así prender o apagar el micrófono es un replaceTrack sin renegociar.
   let audio = null; // { ctx, pantalla, micro, mudaMicro, microReal }
 
+  // Silencio "activo": una fuente en cero conectada, para que la pista emita paquetes de verdad.
   function pistaMuda(ctx) {
-    return ctx.createMediaStreamDestination().stream.getAudioTracks()[0];
+    const destino = ctx.createMediaStreamDestination();
+    const cero = ctx.createConstantSource();
+    cero.offset.value = 0;
+    cero.connect(destino);
+    cero.start();
+    return destino.stream.getAudioTracks()[0];
   }
 
   async function reemplazarMicro(nueva) {
@@ -871,6 +902,8 @@ function mirar(sala, nombre) {
   let suscrita = null; // a la que está conectada esta butaca
   let cola = Promise.resolve();
   let vigia = null;
+  let capaPedida = null; // la capa con la que está suscrita esta butaca
+  let ultimoEstado = null;
   const medir = crearMedidor();
 
   let vista = guardado.leer('vista', 'auto');
@@ -883,13 +916,18 @@ function mirar(sala, nombre) {
     vista = Object.hasOwn(VISTAS, selVista.value) ? selVista.value : 'auto';
     guardado.escribir('vista', vista);
     canal?.enviar({ tipo: 'vista', valor: vista });
-    if (pc && suscrita != null) {
-      encolar(async () => {
-        const r = await canal.pedido('capa', VISTAS[vista]);
-        if (r.sdp) await renegociar(pc, r.sdp);
-      });
-    }
+    encolar(cambiarCapa);
   });
+
+  // Va en la cola: si había una suscripción en curso, se aplica cuando termina.
+  async function cambiarCapa() {
+    if (!pc || suscrita == null || capaPedida === vista) return;
+    const conexion = pc;
+    const pedida = vista;
+    const r = await canal.pedido('capa', VISTAS[pedida]);
+    if (r.sdp && pc === conexion) await renegociar(conexion, r.sdp);
+    capaPedida = pedida;
+  }
 
   for (const [clave, el] of Object.entries(sonidos)) {
     el.autoplay = true;
@@ -931,6 +969,19 @@ function mirar(sala, nombre) {
 
   let reintentoSonido = null;
   let claveSonido = null;
+
+  // Si se anuncia un sonido que esta butaca no recibe (por ejemplo, se prendió el micrófono
+  // después de entrar), volver a suscribirse para sumarlo. Una vez por cambio, para no entrar en bucle.
+  function revisarSonidos() {
+    const msg = ultimoEstado;
+    if (!msg || !pc || suscrita !== publicacion) return;
+    const falta = (msg.microfono && !sonidos.micro.srcObject) || (msg.sonidoPantalla && !sonidos.pantalla.srcObject);
+    const clave = `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`;
+    if (!falta || claveSonido === clave) return;
+    claveSonido = clave;
+    clearTimeout(reintentoSonido);
+    reintentoSonido = setTimeout(() => { suscrita = null; encolar(suscribir); }, 1500);
+  }
   let reintento = null;
   function programarReintento() {
     clearTimeout(reintento);
@@ -958,16 +1009,9 @@ function mirar(sala, nombre) {
         return;
       }
       publicacion = msg.publicacion;
-      // Si apareció un sonido que esta butaca no recibe (por ejemplo, se prendió el micrófono
-      // después de entrar), volver a suscribirse para sumarlo.
-      const falta = (msg.microfono && !sonidos.micro.srcObject) || (msg.sonidoPantalla && !sonidos.pantalla.srcObject);
+      ultimoEstado = msg;
       if (publicacion !== suscrita) encolar(suscribir);
-      else if (falta && pc && claveSonido !== `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`) {
-        // Una sola vez por cambio de sonido, para no reconectar en bucle.
-        claveSonido = `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`;
-        clearTimeout(reintentoSonido);
-        reintentoSonido = setTimeout(() => { suscrita = null; encolar(suscribir); }, 1500);
-      }
+      else revisarSonidos();
     });
     canal.on('cerrado', (ev) => {
       enVivo = false;
@@ -988,8 +1032,10 @@ function mirar(sala, nombre) {
     nueva.addEventListener('connectionstatechange', () => {
       if (pc === nueva && nueva.connectionState === 'failed') programarReintento();
     });
-    const r = await canal.pedido('suscribir', VISTAS[vista]);
+    const pedida = vista;
+    const r = await canal.pedido('suscribir', VISTAS[pedida]);
     if (pc !== nueva) return;
+    capaPedida = pedida;
     await renegociar(nueva, r.sdp);
     if (pc !== nueva) return;
     suscrita = r.publicacion ?? publicacion;
@@ -1006,6 +1052,9 @@ function mirar(sala, nombre) {
     reproducir();
     // Si en 10 s no llegó imagen, volver a suscribirse.
     vigia = setTimeout(() => { if (pc === nueva && !video.videoWidth) programarReintento(); }, 10000);
+    // Si mientras tanto cambió la calidad elegida o falta un sonido anunciado, ponerse al día.
+    if (vista !== capaPedida) encolar(cambiarCapa);
+    revisarSonidos();
   }
 
   // Oferta del SFU: contestarla y mandar la respuesta.

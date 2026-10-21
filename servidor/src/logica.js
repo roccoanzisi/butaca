@@ -2,6 +2,7 @@ export const VISTAS = ['auto', 'h', 'q'];
 export const PISTAS = ['video', 'pantalla', 'micro'];
 export const esObjeto = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 export const slugValido = v => typeof v === 'string' && /^[a-z0-9-]{1,32}$/.test(v);
+export const claveValida = v => typeof v === 'string' && /^[A-Za-z0-9-]{16,64}$/.test(v);
 
 export function nombreValido(nombre) {
   if (typeof nombre !== 'string' || /[\p{Cc}\p{Cf}]/u.test(nombre)) throw new Error('Nombre inválido');

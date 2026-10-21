@@ -7,8 +7,8 @@ entra por Buenos Aires, Córdoba, Neuquén o São Paulo).
 
 ## Secretos y variables del Worker
 
-- `CF_APP_ID` (var) y `CF_APP_SECRET` (secret): app de Realtime SFU.
-- `CF_TURN_KEY_ID` (var) y `CF_TURN_KEY_TOKEN` (secret): clave de TURN. Opcionales: sin ellas se usa sólo `stun:stun.cloudflare.com:3478`.
+- `CF_APP_ID` y `CF_APP_SECRET` (secrets): app de Realtime SFU. `sessions/new` va sin cuerpo (`{}` da `decoding_error`).
+- `CF_TURN_KEY_ID` y `CF_TURN_KEY_TOKEN` (secrets): clave de TURN. Opcionales: sin ellas se usa sólo `stun:stun.cloudflare.com:3478`.
 - API: `https://rtc.live.cloudflare.com/v1`, header `Authorization: Bearer <secreto>`.
   - SFU: `POST /apps/{CF_APP_ID}/sessions/new`, `POST /apps/{id}/sessions/{s}/tracks/new`,
     `PUT .../renegotiate`, `PUT .../tracks/update`, `PUT .../tracks/close`.
@@ -16,7 +16,11 @@ entra por Buenos Aires, Córdoba, Neuquén o São Paulo).
 
 ## Conexión
 
-`GET wss://<worker>/sala/<slug>?rol=cabina|butaca&nombre=<texto>&vista=auto|h|q`
+`GET wss://<worker>/sala/<slug>?rol=cabina|butaca&nombre=<texto>&vista=auto|h|q[&clave=<clave de cabina>]`
+
+- La cabina manda `clave` (16 a 64 caracteres `[A-Za-z0-9-]`), generada y guardada en la compu de quien la abre.
+  No va en el link de los amigos. La sala queda atada a esa clave; otra clave se rechaza con `4003` `ajena`
+  mientras haya una cabina conectada o no hayan pasado 30 min desde que se desconectó la última.
 
 - `slug`: `[a-z0-9-]{1,32}`. Otra cosa: 400.
 - CORS / Origin: aceptar cualquier origen (la app de escritorio usa `file://`, Origin `null`).
@@ -41,7 +45,7 @@ Los pedidos de una misma conexión se procesan de a uno (cola), porque Cloudflar
 
 ### Cabina
 
-- `publicar` — `datos: { "sdp": "<oferta>", "pistas": [ { "mid": "0", "trackName": "video" }, { "mid": "1", "trackName": "pantalla" }, { "mid": "2", "trackName": "micro" } ] }`
+- `publicar` — `datos: { "sdp": "<oferta>", "sonido": { "pantalla": bool, "micro": bool }, "pistas": [ { "mid": "0", "trackName": "video" }, { "mid": "1", "trackName": "pantalla" }, { "mid": "2", "trackName": "micro" } ] }`
   1. `sessions/new` (una sesión nueva por publicación).
   2. `tracks/new` con `{ "sessionDescription": { "type": "offer", "sdp": ... }, "tracks": [ { "location": "local", "mid": ..., "trackName": ... } ] }`.
   3. Responde `{ "sdp": "<answer de Cloudflare>" }`.
@@ -53,8 +57,9 @@ Los pedidos de una misma conexión se procesan de a uno (cola), porque Cloudflar
 ### Butaca
 
 - `suscribir` — `datos: { "capa": "f"|"h"|"q", "auto": bool }`. Requiere publicación activa (si no: error "La transmisión todavía no empezó").
-  1. Si la butaca no tiene sesión o la tiene de una publicación anterior: `sessions/new`.
-  2. `tracks/new` con
+  1. Siempre `sessions/new` (la butaca usa una RTCPeerConnection nueva por suscripción); se cierran las pistas de la sesión anterior.
+     Máximo 12 suscripciones por minuto por conexión.
+  2. `tracks/new` sólo con las pistas de audio que la cabina declaró reales (pedir una pista sin paquetes hace esperar a Cloudflare y falla con "No track data"); si igual falla así, reintenta sólo con video. Ejemplo con todo:
      ```json
      { "tracks": [
        { "location": "remote", "sessionId": "<pub>", "trackName": "video",

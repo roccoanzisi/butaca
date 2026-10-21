@@ -1,9 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
-import { VISTAS, esObjeto, slugValido, nombreValido, validarMedida, validarSdp,
+import { VISTAS, esObjeto, slugValido, claveValida, nombreValido, validarMedida, validarSdp,
   cuerpoPublicar, cuerpoSuscribir, cuerpoCapa } from './logica.js';
 
 const API = 'https://rtc.live.cloudflare.com/v1';
 const STUN = { urls: 'stun:stun.cloudflare.com:3478' };
+// La cabina queda atada a la clave de la compu que la abrió; se libera tras 30 min sin cabina conectada.
+const RESERVA_CABINA_MS = 30 * 60 * 1000;
+const SUSCRIPCIONES_POR_MINUTO = 12;
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type' };
 const json = (body, status = 200) => Response.json(body, { status, headers: CORS });
@@ -15,7 +18,9 @@ function conexion(url) {
   const vista = url.searchParams.get('vista') ?? 'auto';
   if (!['cabina', 'butaca'].includes(rol)) throw new Error('Rol inválido');
   if (!VISTAS.includes(vista)) throw new Error('Vista inválida');
-  return { slug: match[1], rol, vista, nombre: nombreValido(url.searchParams.get('nombre') ?? '') };
+  const clave = url.searchParams.get('clave');
+  if (rol === 'cabina' && !claveValida(clave)) throw new Error('Falta la clave de la cabina');
+  return { slug: match[1], rol, vista, clave, nombre: nombreValido(url.searchParams.get('nombre') ?? '') };
 }
 
 export default {
@@ -85,13 +90,22 @@ export class Sala extends DurableObject {
     const [client, ws] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(ws);
     const miembros = [...this.sockets.values()];
-    if (info.rol === 'cabina' && miembros.some(s => s.info.rol === 'cabina' && s.ws.readyState === 1)) {
+    const dueno = this.estado.dueno;
+    const ajena = info.rol === 'cabina' && dueno && dueno.clave !== info.clave
+      && (miembros.some(s => s.info.rol === 'cabina') || Date.now() - dueno.ultimo < RESERVA_CABINA_MS);
+    if (ajena) {
+      ws.close(4003, 'ajena');
+    } else if (info.rol === 'cabina' && miembros.some(s => s.info.rol === 'cabina' && s.ws.readyState === 1)) {
       ws.close(4001, 'ocupada');
     } else if (info.rol === 'butaca' && miembros.filter(s => s.info.rol === 'butaca' && s.ws.readyState === 1).length >= 40) {
       ws.close(4002, 'llena');
     } else {
+      if (info.rol === 'cabina') {
+        this.estado.dueno = { clave: info.clave, ultimo: Date.now() };
+        this.ctx.waitUntil(this.guardar());
+      }
       info = { rol: info.rol, nombre: info.nombre, vista: info.vista,
-        id: crypto.randomUUID().slice(0, 12), sesion: null, lista: false };
+        id: crypto.randomUUID().slice(0, 12), sesion: null, lista: false, suscripciones: [] };
       this.adjuntar(ws, info);
       this.sockets.set(info.id, { ws, info });
       // La bienvenida antecede al estado y a cualquier respuesta, incluso con TURN lento.
@@ -123,7 +137,7 @@ export class Sala extends DurableObject {
     if (!this.env.CF_TURN_KEY_ID || !this.env.CF_TURN_KEY_TOKEN) return [STUN];
     try {
       const datos = await this.api(`/turn/keys/${encodeURIComponent(this.env.CF_TURN_KEY_ID)}/credentials/generate-ice-servers`,
-        'POST', { ttl: 86400 }, 'TURN', this.env.CF_TURN_KEY_TOKEN);
+        'POST', { ttl: 14400 }, 'TURN', this.env.CF_TURN_KEY_TOKEN);
       return [STUN, ...(Array.isArray(datos.iceServers) ? datos.iceServers : [])];
     } catch { return [STUN]; }
   }
@@ -163,6 +177,12 @@ export class Sala extends DurableObject {
     if (typeof datos.sessionId !== 'string' || !datos.sessionId) throw new Error('Cloudflare no devolvió la sesión');
     return datos.sessionId;
   }
+  // Cierra las pistas de la sesión anterior de una butaca (si se va o se vuelve a suscribir).
+  async cerrarSesion(sesion) {
+    if (!sesion?.pistas?.length) return;
+    await this.cerrarPistas({ sessionId: sesion.sessionId, pistas: sesion.pistas });
+  }
+
   async cerrarPistas(publicacion) {
     if (!publicacion?.pistas?.length) return;
     try {
@@ -221,6 +241,10 @@ export class Sala extends DurableObject {
     if (!acciones.includes(accion)) throw new Error('Acción no permitida');
     if (accion === 'publicar') {
       const cuerpo = cuerpoPublicar(datos);
+      if (esObjeto(datos.sonido) && typeof datos.sonido.pantalla === 'boolean' && typeof datos.sonido.micro === 'boolean') {
+        this.estado.sonidoPantalla = datos.sonido.pantalla;
+        this.estado.microfono = datos.sonido.micro;
+      }
       const sessionId = await this.nuevaSesion();
       this.comprobar(info);
       const respuesta = await this.sfu(sessionId, 'tracks/new', 'POST', cuerpo, 'la publicación');
@@ -259,6 +283,10 @@ export class Sala extends DurableObject {
     const pub = this.estado.publicacion;
     if (!pub) throw new Error('La transmisión todavía no empezó');
     if (accion === 'suscribir') {
+      const ahora = Date.now();
+      info.suscripciones = (info.suscripciones ?? []).filter(t => ahora - t < 60000);
+      if (info.suscripciones.length >= SUSCRIPCIONES_POR_MINUTO) throw new Error('Demasiados intentos seguidos; esperá un momento');
+      info.suscripciones.push(ahora);
       const cuerpo = cuerpoSuscribir(pub.sessionId, datos);
       // Cada suscripción usa una conexión WebRTC nueva del lado de la butaca: sesión nueva también.
       // Si un audio todavía no tiene paquetes, Cloudflare rechaza todo el pedido (y deja la sesión
@@ -266,7 +294,10 @@ export class Sala extends DurableObject {
       let respuesta;
       let pedidas = cuerpo.tracks;
       let sessionId;
-      for (const nombres of [['video', 'pantalla', 'micro'], ['video', 'pantalla'], ['video']]) {
+      // Sólo los sonidos que la cabina dice tener: pedir una pista sin paquetes hace esperar a Cloudflare.
+      const reales = ['video', ...(this.estado.sonidoPantalla ? ['pantalla'] : []), ...(this.estado.microfono ? ['micro'] : [])];
+      const intentos = reales.length > 1 ? [reales, ['video']] : [reales];
+      for (const nombres of intentos) {
         pedidas = cuerpo.tracks.filter(t => nombres.includes(t.trackName));
         sessionId = await this.nuevaSesion();
         this.comprobar(info, pub);
@@ -278,8 +309,10 @@ export class Sala extends DurableObject {
         }
       }
       this.comprobar(info, pub);
+      const vieja = info.sesion;
       const sesion = { sessionId, publicacion: pub.numero, pendiente: false, pistas: [] };
       info.sesion = sesion;
+      this.ctx.waitUntil(this.cerrarSesion(vieja));
       const sdp = validarSdp(respuesta.sessionDescription?.sdp);
       if (!Array.isArray(respuesta.tracks) || respuesta.tracks.length !== pedidas.length ||
           pedidas.some(t => !respuesta.tracks.some(r => r.trackName === t.trackName && typeof r.mid === 'string'))) {
@@ -321,13 +354,17 @@ export class Sala extends DurableObject {
     this.sockets.delete(id);
     try { ws.close(code === 1005 || code === 1006 ? 1000 : code, ''); } catch { /* Ya cerrado. */ }
     let anterior;
-    if (miembro.info.rol === 'cabina' && this.estado.publicacion?.dueno === id) {
-      anterior = this.estado.publicacion;
-      this.estado.publicacion = null;
+    if (miembro.info.rol === 'cabina') {
+      if (this.estado.dueno) this.estado.dueno.ultimo = Date.now();
+      if (this.estado.publicacion?.dueno === id) {
+        anterior = this.estado.publicacion;
+        this.estado.publicacion = null;
+      }
       await this.guardar();
     }
     this.difundir();
     await this.cerrarPistas(anterior);
+    if (miembro.info.rol === 'butaca') await this.cerrarSesion(miembro.info.sesion);
   }
   webSocketError(ws) { return this.webSocketClose(ws, 1011); }
 }
