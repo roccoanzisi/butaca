@@ -53,16 +53,22 @@ function permisos() {
   session.defaultSession.setPermissionRequestHandler((_wc, permiso, responder) => responder(permitidos.has(permiso)));
   session.defaultSession.setPermissionCheckHandler((_wc, permiso) => permitidos.has(permiso));
 
-  session.defaultSession.setDisplayMediaRequestHandler(async (request, responder) => {
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, responderUnaVez) => {
     const elegido = pedido;
     pedido = null;
+    let respondido = false;
+    const responder = (respuesta) => {
+      if (respondido) return;
+      respondido = true;
+      responderUnaVez(respuesta); // null = rechazar
+    };
     try {
       const fuentes = await desktopCapturer.getSources({ types: ['screen', 'window'] });
       let fuente = null;
       if (elegido?.id) fuente = fuentes.find((f) => f.id === elegido.id);
       else if (PRUEBA && process.env.BUTACA_PRUEBA_FUENTE === 'ventana') fuente = fuentes.find((f) => f.id.startsWith('window:')) || fuentes[0];
       else if (PRUEBA || WAYLAND) fuente = fuentes.find((f) => f.id.startsWith('screen:')) || fuentes[0];
-      if (!fuente) return responder({});
+      if (!fuente) return responder(null);
       const sonido = elegido ? elegido.sonido : PRUEBA;
       // Sonido de todo el sistema por loopback (Windows y Linux con PulseAudio/PipeWire).
       if (sonido && request.audioRequested) {
@@ -71,7 +77,7 @@ function permisos() {
         responder({ video: fuente });
       }
     } catch {
-      responder({});
+      responder(null);
     }
   });
 }
@@ -81,8 +87,10 @@ ipcMain.handle('fuentes:listar', async () => {
     types: ['screen', 'window'],
     thumbnailSize: { width: 320, height: 180 },
   });
+  // Sin la propia ventana de Butaca: compartirla mostraría un espejo infinito.
+  const propias = new Set(BrowserWindow.getAllWindows().map((v) => v.getMediaSourceId()));
   return fuentes
-    .filter((f) => !f.name.startsWith('Butaca'))
+    .filter((f) => !propias.has(f.id))
     .map((f) => ({
       id: f.id,
       nombre: f.name,

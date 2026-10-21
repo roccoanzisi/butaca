@@ -414,7 +414,19 @@ function iniciarCabina(sala) {
     else nota.textContent = 'Sin sonido. Para sumar el de la pantalla, volvé a compartir eligiendo una pestaña (o la pantalla completa en Windows) con "Compartir audio" activado.';
   }
 
+  // Un solo pedido de pantalla a la vez (el selector y el portal pueden tardar).
+  let pidiendo = false;
   async function compartir() {
+    if (pidiendo || stream) return;
+    pidiendo = true;
+    try {
+      await compartirAhora();
+    } finally {
+      pidiendo = false;
+    }
+  }
+
+  async function compartirAhora() {
     const c = CALIDADES[calidad];
     // El AudioContext (para las pistas mudas) se crea dentro del clic.
     const ctx = new AudioContext();
@@ -443,7 +455,7 @@ function iniciarCabina(sala) {
         captura = await pedir(sonidoCompu);
       } catch (err) {
         // En la app, una compu sin salida de audio puede rechazar el loopback: probar sólo con imagen.
-        if (!escritorio || !sonidoCompu || err.name === 'NotAllowedError') throw err;
+        if (!escritorio || !sonidoCompu || err.name === 'NotAllowedError' || err.name === 'AbortError') throw err;
         captura = await pedir(false);
       }
     } catch (err) {
