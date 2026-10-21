@@ -24,7 +24,7 @@ const VISTAS = {
 // Capas de simulcast que sube la cabina: completa, media (~720p) y baja (~360p).
 function capasSimulcast(c) {
   return [
-    { rid: 'f', maxBitrate: c.kbps * 1000, maxFramerate: c.fps },
+    { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: c.kbps * 1000, maxFramerate: c.fps },
     { rid: 'h', scaleResolutionDownBy: Math.max(1.5, c.alto / 720), maxBitrate: Math.min(c.kbps, 1800) * 1000, maxFramerate: c.fps },
     { rid: 'q', scaleResolutionDownBy: Math.max(3, c.alto / 360), maxBitrate: 600 * 1000, maxFramerate: 30 },
   ];
@@ -495,7 +495,7 @@ function iniciarCabina(sala) {
 
   // Seguro: si con H264 no codifica de verdad la placa de video (por ejemplo, Chrome cae al codificador
   // por software al hacer simulcast) o saca pocos cuadros, volver a VP8, que por software anda mucho mejor.
-  function vigilarPlaca(conexion) {
+  function vigilarPlaca(conexion, muestra = 1) {
     setTimeout(async () => {
       if (pc !== conexion || !stream) return;
       try {
@@ -507,13 +507,19 @@ function iniciarCabina(sala) {
           if (x.type === 'media-source' && x.kind === 'video') fuente = x;
         });
         const placa = salida?.powerEfficientEncoder === true || /MediaFoundation|NVENC|AMF|QuickSync|Vaapi|VideoToolbox/i.test(salida?.encoderImplementation || '');
-        const lenta = (salida?.framesPerSecond || 0) < (fuente?.framesPerSecond || 30) * 0.7;
-        if (!placa || /OpenH264/i.test(salida?.encoderImplementation || '') || lenta) {
+        // Pocos cuadros por falta de subida no es culpa del codificador: eso no cuenta.
+        const lenta = salida?.qualityLimitationReason !== 'bandwidth'
+          && (salida?.framesPerSecond || 0) < (fuente?.framesPerSecond || 30) * 0.7;
+        if (!placa || /OpenH264/i.test(salida?.encoderImplementation || '')) {
           sinPlaca = true;
           publicar().catch(errorPublicar);
+        } else if (lenta) {
+          // Lenta en dos muestras seguidas: recién ahí se descarta la placa.
+          if (muestra >= 2) { sinPlaca = true; publicar().catch(errorPublicar); }
+          else vigilarPlaca(conexion, muestra + 1);
         }
       } catch { /* sin estadísticas: dejar como está */ }
-    }, 8000);
+    }, muestra === 1 ? 8000 : 6000);
   }
 
   function errorPublicar(err) {
