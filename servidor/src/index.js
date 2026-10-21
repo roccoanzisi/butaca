@@ -134,7 +134,8 @@ export class Sala extends DurableObject {
     try {
       response = await fetch(`${API}${path}`, { method,
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
+        // sessions/new no acepta cuerpo vacío ("{}" da decoding_error): sin cuerpo cuando no hay datos.
+        body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000) });
       datos = await response.json();
     } catch { throw new Error(`No se pudo contactar a Cloudflare: ${operacion}`); }
     const fallo = !response.ok || !esObjeto(datos) || datos.errorCode || datos.error ||
@@ -158,7 +159,7 @@ export class Sala extends DurableObject {
     return this.api(sessionId ? `${base}/${encodeURIComponent(sessionId)}/${endpoint}` : `${base}/new`, method, body, operacion);
   }
   async nuevaSesion() {
-    const datos = await this.sfu(null, '', 'POST', {}, 'la sesión');
+    const datos = await this.sfu(null, '', 'POST', undefined, 'la sesión');
     if (typeof datos.sessionId !== 'string' || !datos.sessionId) throw new Error('Cloudflare no devolvió la sesión');
     return datos.sessionId;
   }
@@ -260,16 +261,28 @@ export class Sala extends DurableObject {
     if (accion === 'suscribir') {
       const cuerpo = cuerpoSuscribir(pub.sessionId, datos);
       // Cada suscripción usa una conexión WebRTC nueva del lado de la butaca: sesión nueva también.
-      const sessionId = await this.nuevaSesion();
+      // Si un audio todavía no tiene paquetes, Cloudflare rechaza todo el pedido (y deja la sesión
+      // trabada): probar con menos pistas, en una sesión nueva cada vez, para que el video llegue igual.
+      let respuesta;
+      let pedidas = cuerpo.tracks;
+      let sessionId;
+      for (const nombres of [['video', 'pantalla', 'micro'], ['video', 'pantalla'], ['video']]) {
+        pedidas = cuerpo.tracks.filter(t => nombres.includes(t.trackName));
+        sessionId = await this.nuevaSesion();
+        this.comprobar(info, pub);
+        try {
+          respuesta = await this.sfu(sessionId, 'tracks/new', 'POST', { tracks: pedidas }, 'la suscripción');
+          break;
+        } catch (e) {
+          if (!/No track data/i.test(e.message) || nombres.length === 1) throw e;
+        }
+      }
       this.comprobar(info, pub);
       const sesion = { sessionId, publicacion: pub.numero, pendiente: false, pistas: [] };
       info.sesion = sesion;
-      this.adjuntar(ws, info);
-      const respuesta = await this.sfu(sesion.sessionId, 'tracks/new', 'POST', cuerpo, 'la suscripción');
-      this.comprobar(info, pub);
       const sdp = validarSdp(respuesta.sessionDescription?.sdp);
-      if (!Array.isArray(respuesta.tracks) || respuesta.tracks.length !== 3 ||
-          cuerpo.tracks.some(t => !respuesta.tracks.some(r => r.trackName === t.trackName && typeof r.mid === 'string'))) {
+      if (!Array.isArray(respuesta.tracks) || respuesta.tracks.length !== pedidas.length ||
+          pedidas.some(t => !respuesta.tracks.some(r => r.trackName === t.trackName && typeof r.mid === 'string'))) {
         throw new Error('Cloudflare no devolvió las pistas');
       }
       sesion.pistas = respuesta.tracks.map(({ trackName, mid }) => ({ trackName, mid }));

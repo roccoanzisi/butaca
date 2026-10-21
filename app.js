@@ -592,6 +592,9 @@ function iniciarCabina(sala) {
     const mia = captura;
     const pista = captura.getVideoTracks()[0];
     pista.addEventListener('ended', cortar);
+    // El contexto tiene que estar andando: si no, la pista muda no emite paquetes
+    // y el SFU rechaza las suscripciones ("No track data from remote peer").
+    await ctx.resume().catch(() => {});
     const mudaMicro = pistaMuda(ctx);
     audio = { ctx, pantalla: captura.getAudioTracks()[0] || pistaMuda(ctx), micro: mudaMicro, mudaMicro, microReal: null };
     stream = new MediaStream([pista, audio.pantalla, audio.micro]);
@@ -926,6 +929,8 @@ function mirar(sala, nombre) {
     return cola;
   }
 
+  let reintentoSonido = null;
+  let claveSonido = null;
   let reintento = null;
   function programarReintento() {
     clearTimeout(reintento);
@@ -953,7 +958,16 @@ function mirar(sala, nombre) {
         return;
       }
       publicacion = msg.publicacion;
+      // Si apareció un sonido que esta butaca no recibe (por ejemplo, se prendió el micrófono
+      // después de entrar), volver a suscribirse para sumarlo.
+      const falta = (msg.microfono && !sonidos.micro.srcObject) || (msg.sonidoPantalla && !sonidos.pantalla.srcObject);
       if (publicacion !== suscrita) encolar(suscribir);
+      else if (falta && pc && claveSonido !== `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`) {
+        // Una sola vez por cambio de sonido, para no reconectar en bucle.
+        claveSonido = `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`;
+        clearTimeout(reintentoSonido);
+        reintentoSonido = setTimeout(() => { suscrita = null; encolar(suscribir); }, 1500);
+      }
     });
     canal.on('cerrado', (ev) => {
       enVivo = false;
