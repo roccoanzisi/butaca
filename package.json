@@ -26,12 +26,14 @@
       "estilos.css",
       "manifest.webmanifest",
       "icono.png",
-      "vendor/**",
       "escritorio/**"
     ],
     "icon": "icono.png",
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "artifactName": "Butaca-${version}-${arch}.${ext}"
     },
     "portable": {
@@ -42,7 +44,10 @@
       "allowToChangeInstallationDirectory": true
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "AudioVideo",
       "maintainer": "roccoanzisi",
       "artifactName": "Butaca-${version}-${arch}.${ext}"

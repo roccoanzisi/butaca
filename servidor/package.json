@@ -1,0 +1,8 @@
+{
+  "name": "butaca-servidor",
+  "private": true,
+  "type": "module",
+  "main": "prueba.mjs",
+  "scripts": { "test": "node --test prueba.mjs", "dev": "wrangler dev", "deploy": "wrangler deploy" },
+  "devDependencies": { "wrangler": "latest" }
+}

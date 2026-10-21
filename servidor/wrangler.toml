@@ -1,0 +1,13 @@
+name = "butaca-servidor"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Secretos (npx wrangler secret put ...): CF_APP_ID, CF_APP_SECRET, CF_TURN_KEY_ID, CF_TURN_KEY_TOKEN.
+
+[[durable_objects.bindings]]
+name = "SALAS"
+class_name = "Sala"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Sala"]
