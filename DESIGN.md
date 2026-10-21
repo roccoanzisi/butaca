@@ -8,14 +8,13 @@ la marquesina de letras sueltas, la linterna ámbar del acomodador y la luz roja
 
 **Demora mínima.** Cada decisión técnica se subordina a eso:
 
-- WebRTC P2P directo de la cabina a cada butaca (sin servidor de medios en el medio).
-- Quien mira pide buffer de jitter 0 (`jitterBufferTarget = 0`, `playoutDelayHint = 0`).
-- Modo "Movimiento" por defecto: `contentHint = 'motion'` + `degradationPreference = 'maintain-framerate'`
-  (si falta red, baja nitidez antes que sumar demora).
-- Bitrate con techo por calidad para no saturar la subida (la congestión se paga en demora).
+- SFU de Cloudflare con nodos en Argentina: la cabina sube una vez en tres capas (simulcast) y cada butaca recibe la suya.
+- Sin tocar el buffer de jitter (forzarlo a 0 se veía a tirones) y con arranque rápido (`x-google-start-bitrate`).
+- Modo "Movimiento" por defecto: `contentHint = 'motion'` + `degradationPreference = 'balanced'`
+  (`maintain-framerate` desplomaba la resolución ante cualquier pérdida).
 - La demora medida (`getStats`) se muestra siempre, en la butaca y en la cabina.
 - Audio sin mezclar: pantalla y micrófono viajan en pistas separadas (sin WebAudio en el camino).
-- Cada butaca elige su tope de calidad; la cabina lo aplica sólo a esa copia (`scaleResolutionDownBy`).
+- Cada butaca elige su capa (Auto, Media, Baja) sin costo para la cabina.
 
 ## Color
 

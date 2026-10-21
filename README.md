@@ -29,12 +29,28 @@ Mientras transmite, puede minimizar la pestaña de Butaca o irse al juego: la tr
 
 ## Cómo funciona
 
-- WebRTC punto a punto de la cabina a cada butaca, sin servidor de video en el medio. Es la opción con menos demora; la demora medida se ve en pantalla.
-- Para encontrarse usan el servidor público de [PeerJS](https://peerjs.com/), que también aporta un TURN de respaldo para redes muy cerradas. Ese servidor no ve el video.
-- Quien transmite manda una copia a cada persona, así que su velocidad de subida limita cuántas personas pueden mirar. La cabina muestra la subida necesaria. Con unas 5 a 8 personas anda bien en una conexión hogareña.
-- Para transmitir hace falta una compu con Chrome, Edge o Firefox. Para mirar alcanza cualquier navegador, celular incluido.
+- El video viaja por el **SFU de Cloudflare Realtime**, que tiene nodos en Buenos Aires, Córdoba, Neuquén y São Paulo. Quien transmite sube la imagen **una sola vez**, en tres calidades (simulcast: completa, ~720p y ~360p), y Cloudflare la reparte. La subida no depende de cuántos miren.
+- Cada persona recibe la calidad que aguanta su conexión ("Auto"), o elige Media o Baja. El cambio es instantáneo y no le cuesta nada a quien transmite.
+- Un Worker de Cloudflare con un Durable Object por sala (`servidor/`) coordina la sala y guarda los secretos. El contrato está en [servidor/PROTOCOLO.md](servidor/PROTOCOLO.md).
+- La cabina queda atada a la compu que la abrió (clave privada que no viaja en el link): nadie con el link puede tomarla.
+- Medido: 1080p 30 fps con 60 a 120 ms de demora, sin pérdidas, con cinco personas mirando.
+- Plan gratis de Cloudflare: 1.000 GB por mes. Una persona mirando en 1080p usa unos 2 GB por hora.
+- Para transmitir hace falta una compu con Chrome, Edge o Firefox, o la app. Para mirar alcanza cualquier navegador, celular incluido.
 
-Diseño: ver [DESIGN.md](DESIGN.md). Sin build: HTML, CSS y JS planos, con PeerJS 1.5.4 incluido en `vendor/`.
+Diseño: ver [DESIGN.md](DESIGN.md). Sin build: HTML, CSS y JS planos.
+
+### Servidor
+
+```
+cd servidor
+npm ci
+npx wrangler secret put CF_APP_ID          # Realtime → Serverless SFU
+npx wrangler secret put CF_APP_SECRET
+npx wrangler secret put CF_TURN_KEY_ID     # Realtime → TURN (opcional, ayuda con CGNAT)
+npx wrangler secret put CF_TURN_KEY_TOKEN
+npx wrangler deploy
+curl https://butaca-servidor.penales-salas.workers.dev/salud
+```
 
 ## Desarrollo de la app de escritorio
 

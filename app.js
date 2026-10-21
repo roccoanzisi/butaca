@@ -1,9 +1,12 @@
 'use strict';
 
-// Butaca: una cabina comparte pantalla por WebRTC P2P (PeerJS), las butacas miran.
-// Prioridad: demora mínima. Ver DESIGN.md.
+// Butaca: una cabina comparte pantalla, las butacas miran.
+// El video viaja por el SFU de Cloudflare Realtime (entra por Buenos Aires, Córdoba, Neuquén o São Paulo):
+// la cabina sube una sola vez, en tres capas (simulcast), y cada butaca recibe la que le da su conexión.
+// Un Worker con un Durable Object por sala coordina todo (servidor/PROTOCOLO.md). Ver DESIGN.md.
 
-const PREFIJO = 'butaca-rocco-';
+// Servidor de salas. Se puede cambiar con ?servidor=ws://... para pruebas locales.
+const SERVIDOR = 'wss://butaca-servidor.penales-salas.workers.dev';
 
 const CALIDADES = {
   liviana: { ancho: 1280, alto: 720, fps: 30, kbps: 2500 },
@@ -11,13 +14,21 @@ const CALIDADES = {
   alta: { ancho: 1920, alto: 1080, fps: 60, kbps: 8000 },
 };
 
-// Calidad que elige cada butaca para sí misma (tope sobre lo que manda la cabina).
+// Capa que pide cada butaca. "auto" deja que el SFU baje de capa si a esa butaca no le da la conexión.
 const VISTAS = {
-  auto: null,
-  '720': { alto: 720, kbps: 2500, fps: 60 },
-  '480': { alto: 480, kbps: 1200, fps: 30 },
-  '360': { alto: 360, kbps: 600, fps: 30 },
+  auto: { capa: 'f', auto: true },
+  h: { capa: 'h', auto: false },
+  q: { capa: 'q', auto: false },
 };
+
+// Capas de simulcast que sube la cabina: completa, media (~720p) y baja (~360p).
+function capasSimulcast(c) {
+  return [
+    { rid: 'f', maxBitrate: c.kbps * 1000, maxFramerate: c.fps },
+    { rid: 'h', scaleResolutionDownBy: Math.max(1.5, c.alto / 720), maxBitrate: Math.min(c.kbps, 1800) * 1000, maxFramerate: c.fps },
+    { rid: 'q', scaleResolutionDownBy: Math.max(3, c.alto / 360), maxBitrate: 600 * 1000, maxFramerate: 30 },
+  ];
+}
 
 const NOTAS_CONTENIDO = {
   movimiento: 'Prioriza fluidez: si la red no alcanza, baja la nitidez antes que sumar demora.',
@@ -26,13 +37,112 @@ const NOTAS_CONTENIDO = {
 
 const $ = (id) => document.getElementById(id);
 
-// Opciones de PeerJS. Con ?ruta=relay se fuerza el TURN (para diagnosticar redes cerradas).
-function opcionesPeer() {
-  const opciones = { debug: 1 };
-  if (new URLSearchParams(location.search).get('ruta') === 'relay' && window.peerjs?.util?.defaultConfig) {
-    opciones.config = { ...window.peerjs.util.defaultConfig, iceTransportPolicy: 'relay' };
+// Clave privada de la cabina de una sala, guardada en esta compu. No viaja en el link de los amigos:
+// así nadie con el link puede adueñarse de la cabina.
+function claveCabina(sala) {
+  let clave = guardado.leer('clave:' + sala, '');
+  if (!/^[A-Za-z0-9-]{16,64}$/.test(clave)) {
+    clave = crypto.randomUUID();
+    guardado.escribir('clave:' + sala, clave);
   }
-  return opciones;
+  return clave;
+}
+
+function urlServidor(sala, params) {
+  const base = new URLSearchParams(location.search).get('servidor') || SERVIDOR;
+  return `${base.replace(/\/$/, '')}/sala/${encodeURIComponent(sala)}?${new URLSearchParams(params)}`;
+}
+
+// WebSocket con el servidor de la sala: pedidos con respuesta, avisos y reconexión sola.
+class Canal {
+  constructor(url) {
+    this.url = url;
+    this.oyentes = new Map();
+    this.pendientes = new Map();
+    this.reqId = 0;
+    this.intentos = 0;
+    this.terminado = false;
+    this.abrir();
+    this.latido = setInterval(() => this.enviar({ tipo: 'ping' }), 20000);
+  }
+
+  abrir() {
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+    ws.onopen = () => { this.intentos = 0; };
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.tipo === 'respuesta') {
+        const p = this.pendientes.get(msg.reqId);
+        if (!p) return;
+        this.pendientes.delete(msg.reqId);
+        if (msg.ok) p.resolver(msg.datos || {});
+        else p.rechazar(new Error(msg.error || 'El servidor no pudo hacerlo.'));
+        return;
+      }
+      this.emitir(msg.tipo, msg);
+    };
+    ws.onclose = (ev) => {
+      if (this.ws !== ws) return;
+      for (const p of this.pendientes.values()) p.rechazar(new Error('Se cortó la conexión con el servidor.'));
+      this.pendientes.clear();
+      this.emitir('cerrado', ev);
+      // 4001 (cabina ocupada), 4002 (sala llena) y 4003 (cabina de otra compu) los decide quien usa el canal.
+      if (!this.terminado && ![4001, 4002, 4003].includes(ev.code)) this.reintentar();
+    };
+  }
+
+  reintentar() {
+    clearTimeout(this.temporizador);
+    this.temporizador = setTimeout(() => this.abrir(), Math.min(8000, 800 * 2 ** this.intentos++));
+  }
+
+  get abierto() {
+    return this.ws.readyState === WebSocket.OPEN;
+  }
+
+  enviar(msg) {
+    if (this.abierto) this.ws.send(JSON.stringify(msg));
+  }
+
+  pedido(accion, datos = {}) {
+    return new Promise((resolver, rechazar) => {
+      if (!this.abierto) { rechazar(new Error('Sin conexión con el servidor.')); return; }
+      const reqId = ++this.reqId;
+      this.pendientes.set(reqId, { resolver, rechazar });
+      this.enviar({ tipo: 'pedido', reqId, accion, datos });
+      setTimeout(() => {
+        if (this.pendientes.delete(reqId)) rechazar(new Error('El servidor no respondió a tiempo.'));
+      }, 30000);
+    });
+  }
+
+  on(tipo, fn) {
+    if (!this.oyentes.has(tipo)) this.oyentes.set(tipo, []);
+    this.oyentes.get(tipo).push(fn);
+  }
+
+  emitir(tipo, msg) {
+    for (const fn of this.oyentes.get(tipo) || []) {
+      try { fn(msg); } catch (err) { console.error(err); }
+    }
+  }
+
+  cerrar() {
+    this.terminado = true;
+    clearInterval(this.latido);
+    clearTimeout(this.temporizador);
+    this.ws.close();
+  }
+}
+
+// Servidores ICE que manda el servidor (STUN y TURN de Cloudflare). Con ?ruta=relay se fuerza el TURN.
+function configuracionRtc(ice) {
+  const config = { iceServers: Array.isArray(ice) && ice.length ? ice : [{ urls: 'stun:stun.cloudflare.com:3478' }], bundlePolicy: 'max-bundle' };
+  if (new URLSearchParams(location.search).get('ruta') === 'relay') config.iceTransportPolicy = 'relay';
+  return config;
 }
 
 // ---------- Utilidades ----------
@@ -167,10 +277,6 @@ function arranqueRapido(kbps) {
   };
 }
 
-function iceDirecto(pc, alCambiar) {
-  pc.addEventListener('connectionstatechange', () => alCambiar(pc.connectionState));
-}
-
 // ---------- Inicio ----------
 
 function iniciarInicio() {
@@ -210,13 +316,16 @@ function iniciarCabina(sala) {
   const btnCompartir = $('btn-compartir');
   const btnCortar = $('btn-cortar');
 
-  const espectadores = new Map(); // peerId -> { conn, nombre, llamada, demora }
+  const espectadores = new Map(); // id -> { id, nombre, vista, medida }
   let captura = null; // lo que da getDisplayMedia
-  let stream = null; // lo que se manda: video de la captura + audio mezclado
-  let peer = null;
+  let stream = null; // lo que se publica: video + sonido de la pantalla + micrófono
+  let canal = null;
+  let ice = null;
+  let pc = null; // conexión con el SFU de Cloudflare
+  let transceptores = null; // { video, pantalla, micro }
   const btnMicro = $('btn-micro');
   let microActivo = false;
-  let intentosId = 0;
+  let intentosOcupada = 0;
   let calidad = CALIDADES[guardado.leer('calidad', 'normal')] ? guardado.leer('calidad', 'normal') : 'normal';
   let contenido = guardado.leer('contenido', 'movimiento') === 'texto' ? 'texto' : 'movimiento';
 
@@ -235,225 +344,179 @@ function iniciarCabina(sala) {
 
   function conectar() {
     aviso('Conectando la cabina', 'Un momento.', false);
-    peer = new Peer(PREFIJO + sala, opcionesPeer());
-
-    peer.on('open', () => {
-      intentosId = 0;
-      if (!stream) aviso('La cabina está lista', 'Elegí la pantalla entera, una ventana o una pestaña. Quien tenga el link la ve al instante.', true);
+    canal = new Canal(urlServidor(sala, { rol: 'cabina', clave: claveCabina(sala) }));
+    canal.on('bienvenida', (msg) => {
+      ice = msg.ice;
+      intentosOcupada = 0;
+      // Si se cortó el servidor en plena transmisión, el servidor olvidó la publicación: volver a publicar.
+      if (stream) publicar().catch(errorPublicar);
+      else aviso('La cabina está lista', 'Elegí la pantalla entera, una ventana o una pestaña. Quien tenga el link la ve al instante.', true);
     });
-
-    peer.on('connection', (conn) => {
-      conn.on('open', () => {
-        const previo = espectadores.get(conn.peer);
-        if (previo && previo.conn !== conn) { previo.llamada?.close(); previo.conn.close(); }
-        const pedida = conn.metadata?.vista;
-        const vista = typeof pedida === 'string' && Object.hasOwn(VISTAS, pedida) ? pedida : 'auto';
-        espectadores.set(conn.peer, { conn, nombre: limpiarNombre(conn.metadata?.nombre), llamada: null, demora: null, vista });
-        if (stream) llamar(conn.peer);
-        difundir();
-      });
-      conn.on('data', (msg) => {
-        const e = espectadores.get(conn.peer);
-        if (!e || e.conn !== conn || !msg || typeof msg !== 'object') return;
-        if (msg.tipo === 'demora' && Number.isFinite(msg.ms)) {
-          e.demora = Math.max(0, Math.min(99999, Math.round(msg.ms)));
-          e.congelamientos = Number.isFinite(msg.congelamientos) ? Math.max(0, Math.round(msg.congelamientos)) : 0;
-          dibujarFila();
-        } else if (msg.tipo === 'vista' && typeof msg.valor === 'string' && Object.hasOwn(VISTAS, msg.valor)) {
-          e.vista = msg.valor;
-          e.tope = null;
-          const pc = e.llamada?.peerConnection;
-          if (pc && pc.connectionState === 'connected') codificar(pc, e);
-          dibujarFila();
-        } else if (msg.tipo === 'pedir-imagen' && stream) {
-          llamar(conn.peer);
-        }
-      });
-      conn.on('close', () => quitar(conn));
-      conn.on('error', () => quitar(conn));
+    canal.on('estado', (msg) => {
+      const anteriores = new Map(espectadores);
+      espectadores.clear();
+      for (const x of Array.isArray(msg.espectadores) ? msg.espectadores : []) {
+        if (!x || typeof x.id !== 'string') continue;
+        espectadores.set(x.id, {
+          id: x.id,
+          nombre: limpiarNombre(x.nombre),
+          vista: Object.hasOwn(VISTAS, x.vista) ? x.vista : 'auto',
+          medida: anteriores.get(x.id)?.medida || null,
+        });
+      }
+      dibujarFila();
     });
-
-    peer.on('disconnected', () => {
-      // Se cayó el servidor de salas; las conexiones P2P siguen. Reconectar para recibir gente nueva.
-      recuperar(peer);
+    canal.on('medida', (msg) => {
+      const e = espectadores.get(msg.id);
+      if (!e) return;
+      const numero = (v, max) => (Number.isFinite(v) ? Math.max(0, Math.min(max, v)) : 0);
+      e.medida = {
+        ms: Math.round(numero(msg.ms, 99999)),
+        perdida: numero(msg.perdida, 1),
+        alto: Math.round(numero(msg.alto, 4320)),
+        relay: msg.relay === true,
+      };
+      dibujarFila();
     });
-
-    peer.on('error', (err) => {
-      if (err.type === 'unavailable-id') {
-        peer.destroy();
-        // Al recargar, el servidor puede tardar unos segundos en soltar el nombre.
-        if (++intentosId <= 4) {
+    canal.on('cerrado', (ev) => {
+      if (stream) {
+        // El servidor olvida la publicación al cortarse: avisar hasta volver a publicar.
+        ponerAire('cabina', false);
+        $('cabina-alerta').textContent = 'Se cortó la conexión con el servidor. Reconectando sola…';
+      }
+      if (ev.code === 4003) {
+        aviso('Esta sala la abrió otra compu',
+          'Si fuiste vos desde otro navegador o desde la app, esperá 30 minutos sin transmitir allá o elegí otro nombre de sala.', false);
+      } else if (ev.code === 4001) {
+        // Al recargar, el servidor puede tardar unos segundos en soltar la cabina anterior.
+        if (++intentosOcupada <= 4) {
           aviso('Conectando la cabina', 'Recuperando la sala…', false);
-          setTimeout(conectar, 3000);
+          setTimeout(() => canal.abrir(), 3000);
         } else {
           aviso('Esta sala ya tiene a alguien transmitiendo', 'Elegí otro nombre de sala desde el inicio.', false);
         }
-      } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-        if (!stream) aviso('No hay conexión con el servidor de salas', 'Revisá tu internet. Se reintenta solo.', false);
-        recuperar(peer);
-      } else if (err.type === 'browser-incompatible') {
-        aviso('Este navegador no sirve para transmitir', 'Probá con Chrome, Edge o Firefox actualizados.', false);
+      } else if (!stream) {
+        aviso('No hay conexión con el servidor de salas', 'Revisá tu internet. Se reintenta solo.', false);
       }
     });
   }
 
-  // PeerJS emite 'error' antes de destruir el peer: decidir un rato después qué hace falta.
-  let temporizadorRecuperar = null;
-  function recuperar(fallido) {
-    clearTimeout(temporizadorRecuperar);
-    temporizadorRecuperar = setTimeout(() => {
-      if (peer !== fallido) return;
-      if (fallido.destroyed) conectar();
-      else if (fallido.disconnected) fallido.reconnect();
-    }, 3000);
+  // Publica la captura en el SFU: una conexión, video en tres capas y dos audios separados.
+  let publicando = Promise.resolve();
+  function publicar() {
+    const hecho = publicando.catch(() => {}).then(publicarAhora);
+    publicando = hecho;
+    return hecho;
   }
 
-  function quitar(conn) {
-    const e = espectadores.get(conn.peer);
-    if (!e || e.conn !== conn) return;
-    e.llamada?.close();
-    espectadores.delete(conn.peer);
-    difundir();
-  }
-
-  function llamar(id) {
-    const e = espectadores.get(id);
-    if (!e || !stream) return;
-    e.llamada?.close();
-    const llamada = peer.call(id, stream, { metadata: { sala }, sdpTransform: arranqueRapido(Math.min(2500, techo(e))) });
-    if (!llamada) return;
-    e.llamada = llamada;
-    const pc = llamada.peerConnection;
-    if (pc) {
-      iceDirecto(pc, (estado) => {
-        if (estado === 'connected') { codificar(pc, e); contarPistas(e, pc); }
-      });
-    }
-    llamada.on('close', () => { if (e.llamada === llamada) e.llamada = null; });
-    llamada.on('error', () => { if (e.llamada === llamada) e.llamada = null; });
-  }
-
-  // Bitrate máximo de una butaca según la calidad de la cabina y la que eligió la butaca.
-  function techo(e) {
+  async function publicarAhora() {
+    if (!stream || !canal?.abierto) return;
+    pc?.close();
     const c = CALIDADES[calidad];
-    const v = VISTAS[e?.vista] || null;
-    return v ? Math.min(c.kbps, v.kbps) : c.kbps;
-  }
-
-  // Regulador por butaca: si hay pérdidas baja el tope y lo sostiene; si la red anda bien, lo sube despacio.
-  // Evita el sube y baja de calidad que produce el estimador de WebRTC probando más de lo que la red banca.
-  async function regular(e) {
-    const pc = e.llamada?.peerConnection;
-    if (!pc || pc.connectionState !== 'connected') return;
-    const stats = await pc.getStats();
-    let salida = null;
-    let remoto = null;
-    let par = null;
-    stats.forEach((x) => {
-      if (x.type === 'outbound-rtp' && x.kind === 'video') salida = x;
-      if (x.type === 'remote-inbound-rtp' && x.kind === 'video') remoto = x;
-      if (x.type === 'candidate-pair' && x.nominated && x.state === 'succeeded') par = x;
-    });
-    const maximo = techo(e);
-    const antes = e.tope ?? maximo;
-    let tope = Math.min(antes, maximo);
-    const perdida = remoto?.fractionLost ?? 0;
-    if (perdida > 0.04) {
-      tope = Math.max(500, Math.round(tope * 0.8));
-      e.estable = 0;
-    } else if (perdida < 0.01) {
-      e.estable = (e.estable || 0) + 1;
-      if (e.estable >= 5 && tope < maximo) { tope = Math.min(maximo, Math.round(tope * 1.1)); e.estable = 0; }
-    }
-    e.tope = tope;
-    if (tope !== antes) codificar(pc, e);
-    e.diag = {
-      limite: salida?.qualityLimitationReason || 'none',
-      relay: par ? stats.get(par.localCandidateId)?.candidateType === 'relay' : false,
-      perdida,
+    const nueva = new RTCPeerConnection(configuracionRtc(ice));
+    pc = nueva;
+    const [pistaVideo] = stream.getVideoTracks();
+    transceptores = {
+      video: nueva.addTransceiver(pistaVideo, { direction: 'sendonly', streams: [stream], sendEncodings: capasSimulcast(c) }),
+      pantalla: nueva.addTransceiver(audio.pantalla, { direction: 'sendonly', streams: [stream] }),
+      micro: nueva.addTransceiver(audio.micro, { direction: 'sendonly', streams: [stream] }),
     };
-  }
-
-  setInterval(() => {
-    for (const e of espectadores.values()) regular(e).catch(() => {});
-    if (stream) avisarLimites();
-  }, 2000);
-
-  // Si la mayoría de las copias están frenadas por CPU o por la subida, decirlo con qué hacer.
-  function avisarLimites() {
-    const nota = $('cabina-alerta');
-    const diags = [...espectadores.values()].map((e) => e.diag).filter(Boolean);
-    const cuantos = (motivo) => diags.filter((d) => d.limite === motivo).length;
-    if (!diags.length) { nota.textContent = ''; return; }
-    if (cuantos('cpu') * 2 > diags.length) {
-      nota.textContent = `Tu compu no da abasto codificando ${diags.length === 1 ? 'la transmisión' : diags.length + ' copias'}: bajá a 720p o cerrá programas pesados.`;
-    } else if (cuantos('bandwidth') * 2 > diags.length) {
-      nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
-    } else {
-      nota.textContent = '';
+    nueva.addEventListener('connectionstatechange', () => {
+      if (pc !== nueva || nueva.connectionState !== 'failed' || !stream) return;
+      setTimeout(() => { if (pc === nueva && stream) publicar().catch(errorPublicar); }, 1500);
+    });
+    await nueva.setLocalDescription(await nueva.createOffer());
+    const { sdp } = await canal.pedido('publicar', {
+      sdp: nueva.localDescription.sdp,
+      sonido: { pantalla: !!captura?.getAudioTracks().length, micro: !!audio?.microReal },
+      pistas: [
+        { mid: transceptores.video.mid, trackName: 'video' },
+        { mid: transceptores.pantalla.mid, trackName: 'pantalla' },
+        { mid: transceptores.micro.mid, trackName: 'micro' },
+      ],
+    });
+    if (pc !== nueva) return;
+    await nueva.setRemoteDescription({ type: 'answer', sdp: arranqueRapido(Math.min(2500, c.kbps))(sdp) });
+    ajustarVideo();
+    avisarSonido();
+    $('cabina-alerta').textContent = '';
+    if (stream) {
+      ponerAire('cabina', true);
+      $('cabina-aviso').hidden = true;
     }
   }
 
-  // Cada butaca tiene su propia copia: se ajusta resolución y bitrate sólo para ella.
-  function codificar(pc, e) {
-    const c = CALIDADES[calidad];
-    const v = VISTAS[e?.vista] || null;
-    for (const sender of pc.getSenders()) {
-      if (sender.track?.kind !== 'video') continue;
-      const p = sender.getParameters();
-      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-      const altoFuente = sender.track.getSettings().height || c.alto;
-      p.encodings[0].scaleResolutionDownBy = v ? Math.max(1, altoFuente / v.alto) : 1;
-      p.encodings[0].maxBitrate = Math.min(techo(e), e?.tope ?? Infinity) * 1000;
-      p.encodings[0].maxFramerate = v ? Math.min(c.fps, v.fps) : c.fps;
-      p.encodings[0].priority = 'high';
-      p.encodings[0].networkPriority = 'high';
-      // "balanced": ante poca red baja un poco resolución y un poco fluidez, sin desplomar ninguna.
-      p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'balanced';
-      sender.setParameters(p).catch(() => {});
-    }
+  function errorPublicar(err) {
+    if (!stream) return;
+    $('cabina-alerta').textContent = `No se pudo publicar la imagen (${err.message}) Se vuelve a intentar sola.`;
+    setTimeout(() => { if (stream && canal?.abierto) publicar().catch(errorPublicar); }, 4000);
   }
 
-  async function aplicarATodos() {
+  // Ajusta las capas de simulcast a la calidad y al tipo de contenido elegidos.
+  function ajustarVideo() {
+    const sender = transceptores?.video.sender;
+    if (!sender) return;
+    const p = sender.getParameters();
+    if (!p.encodings?.length) return;
+    const capas = capasSimulcast(CALIDADES[calidad]);
+    for (const enc of p.encodings) {
+      const capa = capas.find((x) => x.rid === enc.rid);
+      if (capa) Object.assign(enc, capa);
+    }
+    // "balanced": ante poca red baja un poco resolución y un poco fluidez, sin desplomar ninguna.
+    p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'balanced';
+    sender.setParameters(p).catch(() => {});
+  }
+
+  async function aplicarCalidad() {
     if (!stream) return;
     const c = CALIDADES[calidad];
     const pista = stream.getVideoTracks()[0];
     if (pista) {
       pista.contentHint = contenido === 'texto' ? 'detail' : 'motion';
-      // Esperar: la escala de cada butaca se calcula con la altura nueva de la fuente.
       await pista.applyConstraints({ width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } }).catch(() => {});
     }
-    if (!stream) return;
-    for (const e of espectadores.values()) {
-      e.tope = null;
-      const pc = e.llamada?.peerConnection;
-      if (pc && pc.connectionState === 'connected') codificar(pc, e);
-    }
+    ajustarVideo();
+    dibujarFila();
   }
 
-  // Audio en dos pistas separadas, siempre en este orden: pantalla y micrófono.
-  // Si falta una fuente viaja una pista muda en su lugar: prender o apagar el micrófono
-  // es un replaceTrack sin renegociar, y cada butaca regula cada volumen por separado.
+  // Si la imagen está frenada por la CPU o por la subida, decirlo con qué hacer.
+  setInterval(async () => {
+    if (!pc || !stream) return;
+    try {
+      const stats = await pc.getStats();
+      let limite = 'none';
+      stats.forEach((x) => {
+        if (x.type === 'outbound-rtp' && x.kind === 'video' && (x.rid === 'f' || !x.rid)) limite = x.qualityLimitationReason || 'none';
+      });
+      const nota = $('cabina-alerta');
+      if (limite === 'cpu') nota.textContent = 'Tu compu no da abasto codificando: bajá a 720p o cerrá programas pesados.';
+      else if (limite === 'bandwidth') nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
+      else if (!nota.textContent.startsWith('No se pudo')) nota.textContent = '';
+    } catch { /* sin estadísticas */ }
+  }, 3000);
+
+  // Audio en dos pistas separadas: pantalla y micrófono. Si falta una fuente viaja una pista muda,
+  // así prender o apagar el micrófono es un replaceTrack sin renegociar.
   let audio = null; // { ctx, pantalla, micro, mudaMicro, microReal }
 
+  // Silencio "activo": una fuente en cero conectada, para que la pista emita paquetes de verdad.
   function pistaMuda(ctx) {
-    return ctx.createMediaStreamDestination().stream.getAudioTracks()[0];
+    const destino = ctx.createMediaStreamDestination();
+    const cero = ctx.createConstantSource();
+    cero.offset.value = 0;
+    cero.connect(destino);
+    cero.start();
+    return destino.stream.getAudioTracks()[0];
   }
 
   async function reemplazarMicro(nueva) {
     const vieja = audio.micro;
     if (vieja === nueva) return;
     audio.micro = nueva;
-    // Quitar y volver a sumar deja el micrófono último, después de la pantalla.
     stream.removeTrack(vieja);
     stream.addTrack(nueva);
-    const cambios = [];
-    for (const e of espectadores.values()) {
-      for (const sender of e.llamada?.peerConnection?.getSenders() || []) {
-        if (sender.track === vieja) cambios.push(sender.replaceTrack(nueva).catch(() => {}));
-      }
-    }
-    await Promise.all(cambios);
+    await transceptores?.micro.sender.replaceTrack(nueva).catch(() => {});
   }
 
   async function conectarMicro() {
@@ -470,7 +533,7 @@ function iniciarCabina(sala) {
     if (!audio || audio.microReal || !microActivo) { pista.stop(); return !!audio?.microReal; }
     audio.microReal = pista;
     await reemplazarMicro(pista);
-    difundir();
+    avisarSonido();
     return true;
   }
 
@@ -480,14 +543,13 @@ function iniciarCabina(sala) {
     audio.microReal = null;
     await reemplazarMicro(audio.mudaMicro);
     real.stop();
-    difundir();
+    avisarSonido();
   }
 
-  // Avisarle a la butaca qué pista es cuál (por mid, que es igual en las dos puntas).
-  function contarPistas(e, pc) {
-    if (!audio || !e.conn.open) return;
-    const mid = (pista) => pc.getTransceivers().find((t) => t.sender.track === pista)?.mid ?? null;
-    e.conn.send({ tipo: 'pistas', pantalla: mid(audio.pantalla), micro: mid(audio.micro) });
+  // Le cuenta a la sala qué sonidos hay, para mostrar u ocultar cada volumen.
+  function avisarSonido() {
+    if (!canal?.abierto) return;
+    canal.pedido('sonido', { pantalla: !!captura?.getAudioTracks().length, micro: !!audio?.microReal }).catch(() => {});
   }
 
   function contarSonido() {
@@ -561,12 +623,15 @@ function iniciarCabina(sala) {
     const mia = captura;
     const pista = captura.getVideoTracks()[0];
     pista.addEventListener('ended', cortar);
+    // El contexto tiene que estar andando: si no, la pista muda no emite paquetes
+    // y el SFU rechaza las suscripciones ("No track data from remote peer").
+    await ctx.resume().catch(() => {});
     const mudaMicro = pistaMuda(ctx);
     audio = { ctx, pantalla: captura.getAudioTracks()[0] || pistaMuda(ctx), micro: mudaMicro, mudaMicro, microReal: null };
     stream = new MediaStream([pista, audio.pantalla, audio.micro]);
     if (microActivo && !(await operarMicro(conectarMicro))) marcarMicro(false);
     if (captura !== mia) return; // se cortó mientras se pedía el micrófono
-    await aplicarATodos();
+    await aplicarCalidad();
     if (captura !== mia) return; // se cortó mientras se ajustaba la calidad
     video.srcObject = new MediaStream([pista]);
     video.dataset.activo = '';
@@ -575,8 +640,8 @@ function iniciarCabina(sala) {
     ponerAire('cabina', true);
     $('cabina-minimizar').hidden = false;
     contarSonido();
-    for (const id of espectadores.keys()) llamar(id);
-    difundir();
+    dibujarFila();
+    await publicar().catch(errorPublicar);
   }
 
   // Selector propio de la app de escritorio: devuelve { id, sonido } o null.
@@ -642,19 +707,23 @@ function iniciarCabina(sala) {
     audio = null;
     captura = null;
     stream = null;
-    for (const e of espectadores.values()) { e.llamada?.close(); e.llamada = null; }
+    pc?.close();
+    pc = null;
+    transceptores = null;
+    canal?.pedido('cortar').catch(() => {});
     video.srcObject = null;
     delete video.dataset.activo;
     btnCortar.hidden = true;
     $('cabina-minimizar').hidden = true;
+    $('cabina-alerta').textContent = '';
     contarSonido();
     ponerAire('cabina', false);
     aviso('Transmisión cortada', 'Tus amigos siguen en la sala. Cuando vuelvas a compartir, la imagen les aparece sola.', true);
-    difundir();
+    dibujarFila();
   }
 
   // Prender y apagar el micrófono va de a una operación: cada replaceTrack
-  // termina antes de que empiece la siguiente, así ningún sender queda con la pista vieja.
+  // termina antes de que empiece la siguiente.
   let colaMicro = Promise.resolve();
   let pendientesMicro = 0;
   function operarMicro(operacion) {
@@ -688,19 +757,7 @@ function iniciarCabina(sala) {
     contarSonido();
   });
 
-  function difundir() {
-    const estado = {
-      tipo: 'estado',
-      enVivo: !!stream,
-      sonidoPantalla: !!captura?.getAudioTracks().length,
-      microfono: !!audio?.microReal,
-      espectadores: [...espectadores.values()].map((e) => e.nombre),
-    };
-    for (const e of espectadores.values()) {
-      if (e.conn.open) e.conn.send(estado);
-    }
-    dibujarFila();
-  }
+  const NOMBRES_VISTA = { auto: '', h: '720p ', q: '360p ' };
 
   function dibujarFila() {
     const fila = $('cabina-fila');
@@ -721,11 +778,11 @@ function iniciarCabina(sala) {
         li.dataset.ocupada = '';
         const demora = document.createElement('span');
         demora.className = 'fila__demora';
-        const vista = e.vista === 'auto' ? '' : e.vista + 'p ';
-        demora.textContent = e.demora != null && stream ? vista + e.demora + ' ms' : vista.trim();
+        const vista = NOMBRES_VISTA[e.vista] || '';
+        demora.textContent = e.medida && stream ? vista + e.medida.ms + ' ms' : vista.trim();
         const problemas = [];
-        if (e.diag?.relay) problemas.push('conexión por servidor');
-        if ((e.diag?.perdida ?? 0) > 0.04) problemas.push(`pierde ${Math.round(e.diag.perdida * 100)}% de los datos`);
+        if (e.medida?.relay) problemas.push('conexión por servidor TURN');
+        if ((e.medida?.perdida ?? 0) > 0.04) problemas.push(`pierde ${Math.round(e.medida.perdida * 100)}% de los datos`);
         if (problemas.length) {
           li.dataset.problema = '';
           li.title = e.nombre + ': ' + problemas.join(', ');
@@ -736,16 +793,10 @@ function iniciarCabina(sala) {
     }
     const c = CALIDADES[calidad];
     const nota = $('cabina-subida');
-    if (lista.length) {
-      const kbps = lista.reduce((suma, e) => suma + (VISTAS[e.vista] ? Math.min(c.kbps, VISTAS[e.vista].kbps) : c.kbps), 0);
-      const mbps = Math.round(kbps / 100) / 10;
-      nota.textContent = `Tu conexión manda una copia a cada butaca, con la calidad que eligió cada una: hasta ${mbps} Mbps de subida.`
-        + (mbps > 20 || lista.length > 8 ? ' Si se traba o sube la demora, bajá la calidad.' : '');
-      nota.dataset.tono = mbps > 20 || lista.length > 8 ? 'alerta' : '';
-    } else {
-      nota.textContent = 'Todavía no entró nadie. Mandales el link.';
-      nota.dataset.tono = '';
-    }
+    const mbps = Math.round((c.kbps + Math.min(c.kbps, 1800) + 600) / 100) / 10;
+    nota.textContent = lista.length
+      ? `Subís la imagen una sola vez, en tres calidades: unos ${mbps} Mbps, sin importar cuántos miren. Cada butaca recibe la que le da su conexión.`
+      : 'Todavía no entró nadie. Mandales el link.';
   }
 
   function segmentos(id, actual, alElegir) {
@@ -777,14 +828,13 @@ function iniciarCabina(sala) {
   segmentos('sel-calidad', calidad, (v) => {
     calidad = v;
     guardado.escribir('calidad', v);
-    aplicarATodos();
-    dibujarFila();
+    aplicarCalidad();
   });
   segmentos('sel-contenido', contenido, (v) => {
     contenido = v;
     guardado.escribir('contenido', v);
     $('cabina-nota-contenido').textContent = NOTAS_CONTENIDO[v];
-    aplicarATodos();
+    aplicarCalidad();
   });
   $('cabina-nota-contenido').textContent = NOTAS_CONTENIDO[contenido];
 
@@ -804,7 +854,7 @@ function iniciarCabina(sala) {
   window.addEventListener('beforeunload', (e) => {
     if (stream) e.preventDefault();
   });
-  window.addEventListener('pagehide', () => peer?.destroy());
+  window.addEventListener('pagehide', () => { canal?.cerrar(); pc?.close(); });
 
   marcarMicro(guardado.leer('micro', '0') === '1');
   contarSonido();
@@ -844,24 +894,40 @@ function mirar(sala, nombre) {
   const demoraEl = $('sala-demora');
   const selVista = $('sala-calidad');
 
-  let peer = null;
-  let conn = null;
-  let llamada = null;
-  let recibido = null;
-  let mids = null; // qué mid es la pantalla y cuál el micrófono, según la cabina
+  let canal = null;
+  let ice = null;
+  let pc = null; // conexión con el SFU
   let enVivo = false;
-  let reintento = null;
-  let vigiaImagen = null;
+  let publicacion = null; // la última que anunció el servidor
+  let suscrita = null; // a la que está conectada esta butaca
+  let cola = Promise.resolve();
+  let vigia = null;
+  let capaPedida = null; // la capa con la que está suscrita esta butaca
+  let ultimoEstado = null;
   const medir = crearMedidor();
 
   let vista = guardado.leer('vista', 'auto');
+  // Valores de la versión anterior.
+  if (vista === '720') vista = 'h';
+  else if (vista === '480' || vista === '360') vista = 'q';
   if (!Object.hasOwn(VISTAS, vista)) vista = 'auto';
   selVista.value = vista;
   selVista.addEventListener('change', () => {
-    vista = selVista.value;
+    vista = Object.hasOwn(VISTAS, selVista.value) ? selVista.value : 'auto';
     guardado.escribir('vista', vista);
-    if (conn?.open) conn.send({ tipo: 'vista', valor: vista });
+    canal?.enviar({ tipo: 'vista', valor: vista });
+    encolar(cambiarCapa);
   });
+
+  // Va en la cola: si había una suscripción en curso, se aplica cuando termina.
+  async function cambiarCapa() {
+    if (!pc || suscrita == null || capaPedida === vista) return;
+    const conexion = pc;
+    const pedida = vista;
+    const r = await canal.pedido('capa', VISTAS[pedida]);
+    if (r.sdp && pc === conexion) await renegociar(conexion, r.sdp);
+    capaPedida = pedida;
+  }
 
   for (const [clave, el] of Object.entries(sonidos)) {
     el.autoplay = true;
@@ -880,158 +946,125 @@ function mirar(sala, nombre) {
     $('sala-aviso-texto').textContent = texto;
   }
 
-  let temporizadorRecuperar = null;
-  function recuperar(fallido) {
-    clearTimeout(temporizadorRecuperar);
-    temporizadorRecuperar = setTimeout(() => {
-      if (peer !== fallido) return;
-      if (fallido.destroyed) conectar();
-      else if (fallido.disconnected) fallido.reconnect();
-    }, 3000);
-  }
-
-  function reintentar(ms) {
-    clearTimeout(reintento);
-    reintento = setTimeout(conectarCabina, ms);
-  }
-
   function apagarPantalla() {
-    recibido = null;
+    clearTimeout(vigia);
+    pc?.close();
+    pc = null;
+    suscrita = null;
     video.srcObject = null;
-    for (const el of Object.values(sonidos)) el.srcObject = null;
     delete video.dataset.activo;
+    for (const el of Object.values(sonidos)) el.srcObject = null;
     demoraEl.textContent = '';
     btnSonido.hidden = true;
   }
 
-  function conectar() {
-    aviso('Buscando la sala', 'Un momento.');
-    peer = new Peer(opcionesPeer());
-    peer.on('open', conectarCabina);
-    peer.on('call', atender);
-    peer.on('disconnected', () => recuperar(peer));
-    peer.on('error', (err) => {
-      if (err.type === 'peer-unavailable') {
-        if (!enVivo) aviso('La cabina está cerrada', 'Cuando empiece la transmisión en esta sala, la imagen aparece sola. No hace falta recargar.');
-        reintentar(4000);
-      } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-        if (!enVivo) aviso('No hay conexión con el servidor de salas', 'Revisá tu internet. Se reintenta solo.');
-        recuperar(peer);
-      } else if (err.type === 'browser-incompatible') {
-        aviso('Este navegador no puede mostrar la transmisión', 'Probá con Chrome, Edge, Firefox o Safari actualizados.');
-      }
+  // Las operaciones con el SFU van de a una (Cloudflare pide terminar cada renegociación antes de otra).
+  function encolar(tarea) {
+    cola = cola.then(tarea).catch((err) => {
+      console.warn('Butaca:', err.message);
+      if (enVivo) programarReintento();
     });
+    return cola;
   }
 
-  function conectarCabina() {
-    if (!peer || peer.destroyed || peer.disconnected) return;
-    if (conn?.open) return;
-    conn?.close();
-    const actual = peer.connect(PREFIJO + sala, { metadata: { nombre, vista }, serialization: 'json', reliable: true });
-    conn = actual;
-    // Si en 15 s no abrió (red muy cerrada), volver a probar.
-    const limite = setTimeout(() => { if (conn === actual && !actual.open) { actual.close(); reintentar(1000); } }, 15000);
-    actual.on('open', () => {
-      clearTimeout(limite);
+  let reintentoSonido = null;
+  let claveSonido = null;
+
+  // Si se anuncia un sonido que esta butaca no recibe (por ejemplo, se prendió el micrófono
+  // después de entrar), volver a suscribirse para sumarlo. Una vez por cambio, para no entrar en bucle.
+  function revisarSonidos() {
+    const msg = ultimoEstado;
+    if (!msg || !pc || suscrita !== publicacion) return;
+    const falta = (msg.microfono && !sonidos.micro.srcObject) || (msg.sonidoPantalla && !sonidos.pantalla.srcObject);
+    const clave = `${publicacion}:${msg.microfono}:${msg.sonidoPantalla}`;
+    if (!falta || claveSonido === clave) return;
+    claveSonido = clave;
+    clearTimeout(reintentoSonido);
+    reintentoSonido = setTimeout(() => { suscrita = null; encolar(suscribir); }, 1500);
+  }
+  let reintento = null;
+  function programarReintento() {
+    clearTimeout(reintento);
+    reintento = setTimeout(() => { suscrita = null; encolar(suscribir); }, 2000);
+  }
+
+  function conectar() {
+    aviso('Buscando la sala', 'Un momento.');
+    canal = new Canal(urlServidor(sala, { rol: 'butaca', nombre, vista }));
+    canal.on('bienvenida', (msg) => {
+      ice = msg.ice;
+      suscrita = null;
       if (!enVivo) aviso('La función todavía no empezó', 'Ya estás en tu butaca. La pantalla se enciende cuando empiece la transmisión.');
     });
-    actual.on('data', (msg) => {
-      if (conn !== actual || !msg) return;
-      if (msg.tipo === 'pistas') {
-        mids = { pantalla: typeof msg.pantalla === 'string' ? msg.pantalla : null, micro: typeof msg.micro === 'string' ? msg.micro : null };
-        if (llamada?.peerConnection && recibido) asignarAudio(llamada.peerConnection);
-        return;
-      }
-      if (msg.tipo !== 'estado') return;
-      $('sala-control-micro').hidden = !msg.microfono;
-      $('sala-control-pantalla').hidden = !msg.sonidoPantalla;
+    canal.on('estado', (msg) => {
       const n = Array.isArray(msg.espectadores) ? msg.espectadores.length : 0;
       $('sala-cuenta').textContent = n === 1 ? '1 mirando' : n + ' mirando';
+      $('sala-control-micro').hidden = !msg.microfono;
+      $('sala-control-pantalla').hidden = !msg.sonidoPantalla;
       enVivo = !!msg.enVivo;
       ponerAire('sala', enVivo);
-      clearTimeout(vigiaImagen);
       if (!enVivo) {
         apagarPantalla();
         aviso('La función todavía no empezó', 'Ya estás en tu butaca. La pantalla se enciende cuando empiece la transmisión.');
-      } else if (!video.srcObject) {
-        aviso('Recibiendo imagen', 'Un segundo.');
-        vigilarImagen();
+        return;
       }
+      publicacion = msg.publicacion;
+      ultimoEstado = msg;
+      if (publicacion !== suscrita) encolar(suscribir);
+      else revisarSonidos();
     });
-    actual.on('close', () => {
-      clearTimeout(limite);
-      if (conn !== actual) return;
+    canal.on('cerrado', (ev) => {
       enVivo = false;
       ponerAire('sala', false);
-      $('sala-cuenta').textContent = '';
-      llamada?.close();
       apagarPantalla();
-      aviso('La cabina está cerrada', 'Cuando empiece la transmisión en esta sala, la imagen aparece sola. No hace falta recargar.');
-      reintentar(2000);
+      if (ev.code === 4002) aviso('La sala está llena', 'Ya hay 40 personas mirando. Probá de nuevo en un rato.');
+      else aviso('Se cortó la conexión con la sala', 'Reconectando sola…');
     });
   }
 
-  // Si está en vivo pero la imagen no llega, pedirla de nuevo.
-  function vigilarImagen() {
-    clearTimeout(vigiaImagen);
-    vigiaImagen = setTimeout(() => {
-      if (enVivo && !video.srcObject && conn?.open) {
-        conn.send({ tipo: 'pedir-imagen' });
-        vigilarImagen();
-      }
-    }, 8000);
-  }
+  async function suscribir() {
+    if (!enVivo || !canal?.abierto || (pc && suscrita === publicacion)) return;
+    pc?.close();
+    clearTimeout(vigia);
+    if (!video.srcObject) aviso('Recibiendo imagen', 'Un segundo.');
+    const nueva = new RTCPeerConnection(configuracionRtc(ice));
+    pc = nueva;
+    nueva.addEventListener('connectionstatechange', () => {
+      if (pc === nueva && nueva.connectionState === 'failed') programarReintento();
+    });
+    const pedida = vista;
+    const r = await canal.pedido('suscribir', VISTAS[pedida]);
+    if (pc !== nueva) return;
+    capaPedida = pedida;
+    await renegociar(nueva, r.sdp);
+    if (pc !== nueva) return;
+    suscrita = r.publicacion ?? publicacion;
 
-  function atender(nueva) {
-    // Sólo se atiende a la cabina de esta sala.
-    if (nueva.peer !== PREFIJO + sala) { nueva.close(); return; }
-    llamada?.close();
-    llamada = nueva;
-    mids = null;
-    nueva.answer(undefined, { sdpTransform: arranqueRapido(2500) });
-    const pc = nueva.peerConnection;
-    nueva.on('stream', (s) => {
-      // PeerJS avisa una vez por pista (video y audio): reproducir una sola vez.
-      if (llamada !== nueva || recibido === s) return;
-      recibido = s;
-      // Sin tocar el buffer de jitter: el adaptativo de WebRTC suaviza los tirones
-      // a cambio de unos pocos milisegundos (forzarlo a 0 se veía entrecortado).
-      video.srcObject = new MediaStream(s.getVideoTracks());
-      asignarAudio(pc);
-      video.dataset.activo = '';
-      $('sala-aviso').hidden = true;
-      clearTimeout(vigiaImagen);
-      reproducir();
-    });
-    nueva.on('close', () => {
-      if (llamada !== nueva) return;
-      llamada = null;
-      apagarPantalla();
-      if (enVivo) { aviso('Recibiendo imagen', 'Un segundo.'); vigilarImagen(); }
-    });
-    if (pc) {
-      iceDirecto(pc, (estado) => {
-        if (estado === 'failed' && llamada === nueva && conn?.open) conn.send({ tipo: 'pedir-imagen' });
-      });
+    const midDe = (pista) => r.pistas?.find((p) => p.trackName === pista)?.mid;
+    const pistaDe = (pista) => nueva.getTransceivers().find((t) => t.mid === midDe(pista))?.receiver.track || null;
+    const pistaVideo = pistaDe('video');
+    video.srcObject = pistaVideo ? new MediaStream([pistaVideo]) : null;
+    for (const clave of ['pantalla', 'micro']) {
+      const pista = pistaDe(clave);
+      sonidos[clave].srcObject = pista ? new MediaStream([pista]) : null;
     }
+    video.dataset.activo = '';
+    reproducir();
+    // Si en 10 s no llegó imagen, volver a suscribirse.
+    vigia = setTimeout(() => { if (pc === nueva && !video.videoWidth) programarReintento(); }, 10000);
+    // Si mientras tanto cambió la calidad elegida o falta un sonido anunciado, ponerse al día.
+    if (vista !== capaPedida) encolar(cambiarCapa);
+    revisarSonidos();
   }
 
-  // Ubica cada pista de audio por el mid que mandó la cabina; si todavía no llegó, por orden (pantalla, micrófono).
-  function asignarAudio(pc) {
-    const audios = pc.getTransceivers().filter((t) => t.receiver.track?.kind === 'audio');
-    const porMid = (mid) => (mid ? audios.find((t) => t.mid === mid)?.receiver.track : null);
-    const pistas = {
-      pantalla: porMid(mids?.pantalla) || audios[0]?.receiver.track,
-      micro: porMid(mids?.micro) || audios[1]?.receiver.track,
-    };
-    for (const [clave, el] of Object.entries(sonidos)) {
-      const pista = pistas[clave];
-      if (!pista) { el.srcObject = null; continue; }
-      if (el.srcObject?.getAudioTracks()[0] === pista) continue;
-      el.srcObject = new MediaStream([pista]);
-      el.play().catch(() => {});
-    }
+  // Oferta del SFU: contestarla y mandar la respuesta.
+  async function renegociar(conexion, sdp) {
+    await conexion.setRemoteDescription({ type: 'offer', sdp });
+    await conexion.setLocalDescription(await conexion.createAnswer());
+    await canal.pedido('responder', { sdp: conexion.localDescription.sdp });
   }
+
+  video.addEventListener('loadeddata', () => { $('sala-aviso').hidden = true; });
 
   function sonar() {
     return Promise.all(Object.values(sonidos).filter((el) => el.srcObject).map((el) => el.play()));
@@ -1056,9 +1089,9 @@ function mirar(sala, nombre) {
     }
   }
 
-  // Medir demora y contarle a la cabina.
+  // Medir demora, mostrarla y contarle a la cabina.
+  let ultimaMedida = 0;
   setInterval(async () => {
-    const pc = llamada?.peerConnection;
     if (!pc || !video.srcObject) return;
     try {
       const m = await medir(pc);
@@ -1066,10 +1099,13 @@ function mirar(sala, nombre) {
       const resolucion = m.alto ? m.alto + 'p' : '';
       let texto = `${resolucion} ${m.fps} fps, demora ≈ ${m.ms} ms`.trim();
       if (m.perdida > 0.02) texto += `, se pierde el ${Math.round(m.perdida * 100)}% de los datos`;
-      if (m.relay) texto += ', conexión por servidor';
+      if (m.relay) texto += ', conexión por servidor TURN';
       demoraEl.textContent = texto;
       demoraEl.dataset.tono = m.ms > 600 || m.perdida > 0.04 ? 'alerta' : m.ms <= 250 ? 'bien' : '';
-      if (conn?.open) conn.send({ tipo: 'demora', ms: m.ms, congelamientos: m.congelamientos });
+      if (Date.now() - ultimaMedida >= 4000) {
+        ultimaMedida = Date.now();
+        canal?.enviar({ tipo: 'medida', ms: m.ms, perdida: m.perdida, alto: m.alto || 0, fps: m.fps, congelamientos: m.congelamientos, relay: m.relay });
+      }
     } catch { /* sin estadísticas */ }
   }, 1000);
 
@@ -1097,7 +1133,7 @@ function mirar(sala, nombre) {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey && e.target === document.body) pantallaCompleta();
   });
-  window.addEventListener('pagehide', () => peer?.destroy());
+  window.addEventListener('pagehide', () => { canal?.cerrar(); pc?.close(); });
 
   conectar();
 }
