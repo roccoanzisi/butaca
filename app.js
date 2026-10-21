@@ -128,7 +128,7 @@ function crearMedidor() {
     previo = video;
     // Red (ida) + buffer de jitter + decodificación + ~1 cuadro de captura/codificación.
     const fps = video.framesPerSecond || 30;
-    const ms = Math.round(((rtt ?? 0) / 2 + buffer + decodificar) * 1000 + 1000 / fps);
+    const ms = Math.round(((rtt ?? 0) / 2 + buffer + decodificar) * 1000 + Math.min(1000 / fps, 34));
     return { ms, ancho: video.frameWidth, alto: video.frameHeight, fps: Math.round(video.framesPerSecond || 0) };
   };
 }
@@ -141,6 +141,7 @@ function iceDirecto(pc, alCambiar) {
 
 function iniciarInicio() {
   $('vista-inicio').hidden = false;
+  if (window.butacaEscritorio) $('inicio-descarga').hidden = true;
   letrero(document.querySelector('[data-letrero]'), 'Butaca', true);
   const entrada = $('inicio-sala');
   entrada.value = salaLegible(guardado.leer('ultima-sala', ''));
@@ -166,7 +167,9 @@ function iniciarCabina(sala) {
   document.title = 'Cabina: ' + salaLegible(sala) + ' | Butaca';
   letrero($('cabina-letrero'), salaLegible(sala), false);
 
-  const linkSala = location.origin + location.pathname + '?sala=' + encodeURIComponent(sala);
+  const escritorio = window.butacaEscritorio;
+  // En la app de escritorio el link apunta a la versión web, que se abre en cualquier navegador.
+  const linkSala = (escritorio?.linkBase || location.origin + location.pathname) + '?sala=' + encodeURIComponent(sala);
   $('cabina-link').value = linkSala;
 
   const video = $('cabina-video');
@@ -405,7 +408,9 @@ function iniciarCabina(sala) {
     const micro = !!audio?.microReal;
     if (pantalla && micro) nota.textContent = 'Se escuchan la pantalla y tu micrófono, por separado: cada butaca regula cada volumen. Usá auriculares para que no se acople.';
     else if (pantalla) nota.textContent = 'Se escucha el sonido de la pantalla.';
+    else if (micro && escritorio) nota.textContent = 'Se escucha sólo tu micrófono. Para sumar el sonido de la compu, cortá y volvé a compartir con "Incluir el sonido de la compu" marcado.';
     else if (micro) nota.textContent = 'Se escucha sólo tu micrófono. Para sumar el sonido de la pantalla, volvé a compartir eligiendo una pestaña (o la pantalla completa en Windows) con "Compartir audio" activado.';
+    else if (escritorio) nota.textContent = 'Sin sonido de la compu. Para sumarlo, cortá y volvé a compartir con "Incluir el sonido de la compu" marcado.';
     else nota.textContent = 'Sin sonido. Para sumar el de la pantalla, volvé a compartir eligiendo una pestaña (o la pantalla completa en Windows) con "Compartir audio" activado.';
   }
 
@@ -413,21 +418,39 @@ function iniciarCabina(sala) {
     const c = CALIDADES[calidad];
     // El AudioContext (para las pistas mudas) se crea dentro del clic.
     const ctx = new AudioContext();
-    try {
-      captura = await navigator.mediaDevices.getDisplayMedia({
+    let fuente = null;
+    let sonidoCompu = guardado.leer('sonido-compu', '1') === '1';
+    if (escritorio?.selectorPropio) {
+      const eleccion = await elegirFuente();
+      if (!eleccion) { ctx.close(); return; }
+      fuente = eleccion.id;
+      sonidoCompu = eleccion.sonido;
+    }
+    const pedir = async (conSonido) => {
+      if (escritorio) await escritorio.elegirFuente(fuente, conSonido);
+      return navigator.mediaDevices.getDisplayMedia({
         // Abre el selector en "Toda la pantalla"; ventanas y pestañas siguen disponibles.
         video: { displaySurface: 'monitor', width: { ideal: c.ancho }, height: { ideal: c.alto }, frameRate: { ideal: c.fps, max: c.fps } },
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        audio: !escritorio || conSonido ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
         systemAudio: 'include',
         monitorTypeSurfaces: 'include',
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'include',
       });
+    };
+    try {
+      try {
+        captura = await pedir(sonidoCompu);
+      } catch (err) {
+        // En la app, una compu sin salida de audio puede rechazar el loopback: probar sólo con imagen.
+        if (!escritorio || !sonidoCompu || err.name === 'NotAllowedError') throw err;
+        captura = await pedir(false);
+      }
     } catch (err) {
       ctx.close();
       captura = null;
       if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
-        aviso('No se pudo compartir la pantalla', 'El navegador no dio permiso. Probá de nuevo o reiniciá el navegador.', true);
+        aviso('No se pudo compartir la pantalla', 'El sistema no dio permiso. Probá de nuevo o reiniciá la app o el navegador.', true);
       }
       return;
     }
@@ -450,6 +473,61 @@ function iniciarCabina(sala) {
     contarSonido();
     for (const id of espectadores.keys()) llamar(id);
     difundir();
+  }
+
+  // Selector propio de la app de escritorio: devuelve { id, sonido } o null.
+  // El sonido de la compu lo captura la app por loopback (Windows y Linux).
+  async function elegirFuente() {
+    const dialogo = $('selector');
+    const grupos = { pantalla: $('selector-pantallas'), ventana: $('selector-ventanas') };
+    const btnProyectar = $('selector-proyectar');
+    const casilla = $('selector-sonido');
+    let elegida = null;
+
+    grupos.pantalla.textContent = '';
+    grupos.ventana.textContent = '';
+    $('selector-grupo-pantallas').hidden = true;
+    $('selector-grupo-ventanas').hidden = true;
+    $('selector-cargando').hidden = false;
+    $('selector-cargando').textContent = 'Buscando pantallas y ventanas…';
+    btnProyectar.disabled = true;
+    casilla.checked = guardado.leer('sonido-compu', '1') === '1';
+    dialogo.returnValue = '';
+    dialogo.showModal();
+
+    const fuentes = await escritorio.listarFuentes().catch(() => []);
+
+    $('selector-cargando').hidden = fuentes.length > 0;
+    $('selector-cargando').textContent = 'No se encontraron pantallas ni ventanas para compartir.';
+    for (const f of fuentes) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'fuente';
+      b.setAttribute('aria-pressed', 'false');
+      const imagen = f.miniatura ? document.createElement('img') : document.createElement('span');
+      if (f.miniatura) { imagen.src = f.miniatura; imagen.alt = ''; } else imagen.className = 'fuente__sin';
+      const nombre = document.createElement('span');
+      nombre.className = 'fuente__nombre';
+      nombre.textContent = f.tipo === 'pantalla' && fuentes.filter((x) => x.tipo === 'pantalla').length === 1 ? 'Pantalla entera' : f.nombre;
+      b.append(imagen, nombre);
+      b.addEventListener('click', () => {
+        for (const otro of dialogo.querySelectorAll('.fuente')) otro.setAttribute('aria-pressed', 'false');
+        b.setAttribute('aria-pressed', 'true');
+        elegida = f.id;
+        btnProyectar.disabled = false;
+      });
+      b.addEventListener('dblclick', () => { elegida = f.id; dialogo.close('proyectar'); });
+      grupos[f.tipo].append(b);
+      if (f.tipo === 'pantalla') $('selector-grupo-pantallas').hidden = false;
+      else $('selector-grupo-ventanas').hidden = false;
+    }
+    // La primera pantalla queda elegida: es lo más común.
+    grupos.pantalla.querySelector('.fuente')?.click();
+
+    if (dialogo.open) await new Promise((r) => dialogo.addEventListener('close', r, { once: true }));
+    if (dialogo.returnValue !== 'proyectar' || !elegida) return null;
+    guardado.escribir('sonido-compu', casilla.checked ? '1' : '0');
+    return { id: elegida, sonido: casilla.checked };
   }
 
   function cortar() {

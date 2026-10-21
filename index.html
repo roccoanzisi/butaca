@@ -40,12 +40,13 @@
         <button class="boton" type="submit" name="modo" value="cabina">Transmitir desde acá</button>
       </div>
     </form>
+    <p class="inicio__descarga" id="inicio-descarga">¿Vas a transmitir seguido? <a href="https://github.com/roccoanzisi/butaca/releases/latest">Bajá la app para Windows o Linux</a>: elegís la pantalla o una ventana y suma el sonido de la compu.</p>
   </main>
 
   <!-- Cabina: quien transmite -->
   <main id="vista-cabina" class="vista cabina" hidden>
     <header class="barra">
-      <a class="barra__marca" href="./" aria-label="Volver al inicio">Butaca</a>
+      <a class="barra__marca" href="index.html" aria-label="Volver al inicio">Butaca</a>
       <div class="letrero letrero--chico" id="cabina-letrero"></div>
       <span class="aire" id="cabina-aire" data-estado="apagado"><span class="aire__luz"></span><span id="cabina-aire-texto">Fuera del aire</span></span>
     </header>
@@ -115,7 +116,7 @@
 
     <div class="sala__escenario" id="sala-escenario" hidden>
       <header class="barra">
-        <a class="barra__marca" href="./" aria-label="Salir al inicio">Butaca</a>
+        <a class="barra__marca" href="index.html" aria-label="Salir al inicio">Butaca</a>
         <div class="letrero letrero--chico" id="sala-letrero"></div>
         <span class="aire" id="sala-aire" data-estado="apagado"><span class="aire__luz"></span><span id="sala-aire-texto">Fuera del aire</span></span>
         <span class="barra__dato" id="sala-cuenta"></span>
@@ -151,6 +152,25 @@
       </footer>
     </div>
   </main>
+
+  <!-- Selector de pantalla propio: sólo en la app de escritorio -->
+  <dialog class="selector" id="selector" aria-labelledby="selector-titulo">
+    <form method="dialog" class="selector__caja">
+      <h2 class="selector__titulo" id="selector-titulo">Elegí qué proyectar</h2>
+      <p class="selector__vacio" id="selector-cargando">Buscando pantallas y ventanas…</p>
+      <h3 class="selector__grupo" id="selector-grupo-pantallas" hidden>Pantallas</h3>
+      <div class="selector__fuentes" id="selector-pantallas"></div>
+      <h3 class="selector__grupo" id="selector-grupo-ventanas" hidden>Ventanas</h3>
+      <div class="selector__fuentes" id="selector-ventanas"></div>
+      <div class="selector__sonido">
+        <label class="selector__check"><input type="checkbox" id="selector-sonido" checked> Incluir el sonido de la compu</label>
+      </div>
+      <div class="selector__acciones">
+        <button class="boton" value="cancelar" type="submit">Cancelar</button>
+        <button class="boton boton--principal" value="proyectar" type="submit" id="selector-proyectar" disabled>Proyectar</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="vendor/peerjs-1.5.4.min.js"></script>
   <script src="app.js"></script>

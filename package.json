@@ -1,0 +1,52 @@
+{
+  "name": "butaca",
+  "productName": "Butaca",
+  "version": "1.0.0",
+  "description": "Compartí pantalla y sonido en una sala de Butaca.",
+  "main": "escritorio/main.js",
+  "author": "roccoanzisi",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:linux": "electron-builder --linux AppImage deb",
+    "dist:win": "electron-builder --win nsis portable",
+    "prueba": "node prueba/transmision.mjs"
+  },
+  "devDependencies": {
+    "electron": "^44.9.2",
+    "electron-builder": "^26.15.3",
+    "playwright": "^1.64.1"
+  },
+  "build": {
+    "appId": "com.roccoanzisi.butaca",
+    "productName": "Butaca",
+    "files": [
+      "index.html",
+      "app.js",
+      "estilos.css",
+      "manifest.webmanifest",
+      "icono.png",
+      "vendor/**",
+      "escritorio/**"
+    ],
+    "icon": "icono.png",
+    "win": {
+      "target": ["nsis", "portable"],
+      "artifactName": "Butaca-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Butaca-${version}-${arch}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "AudioVideo",
+      "maintainer": "roccoanzisi",
+      "artifactName": "Butaca-${version}-${arch}.${ext}"
+    },
+    "publish": null
+  }
+}

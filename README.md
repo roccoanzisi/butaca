@@ -3,7 +3,13 @@
 Una persona comparte su pantalla en vivo y el resto mira, con la menor demora posible.
 No hace falta crear cuenta ni instalar nada.
 
-**App:** https://roccoanzisi.github.io/butaca/
+**Web:** https://roccoanzisi.github.io/butaca/  
+**App para Windows y Linux:** https://github.com/roccoanzisi/butaca/releases/latest
+
+La app de escritorio es la misma Butaca. Para quien transmite suma un selector propio de pantalla o ventana, y el sonido de toda la compu (loopback) tanto en Windows como en Linux. Para mirar alcanza el link web, aunque la app también sirve.
+
+- Windows: `Butaca-x.y.z-x64.exe` (instalador) o `Butaca-x.y.z-x64-portable.exe` (sin instalar).
+- Linux: `Butaca-x.y.z-x86_64.AppImage` (darle permiso de ejecución) o el `.deb`.
 
 ## Cómo se usa
 
@@ -29,3 +35,15 @@ Mientras transmite, puede minimizar la pestaña de Butaca o irse al juego: la tr
 - Para transmitir hace falta una compu con Chrome, Edge o Firefox. Para mirar alcanza cualquier navegador, celular incluido.
 
 Diseño: ver [DESIGN.md](DESIGN.md). Sin build: HTML, CSS y JS planos, con PeerJS 1.5.4 incluido en `vendor/`.
+
+## Desarrollo de la app de escritorio
+
+```
+npm ci
+npm start                 # abre la app
+npm run prueba            # prueba de punta a punta: la app transmite y un Chromium mira
+npm run dist:linux        # AppImage + deb en dist/
+npm run dist:win          # instalador + portable (mejor en Windows o en CI)
+```
+
+El workflow `Escritorio` corre la prueba en Windows y en Linux, tanto desde el código como desde el ejecutable empaquetado. Con un tag `v*` publica los instaladores en Releases.
