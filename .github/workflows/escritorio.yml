@@ -12,6 +12,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,9 +30,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
       - name: Probar desde fuente (Windows)
+        timeout-minutes: 5
         if: runner.os == 'Windows'
         run: npm run prueba
       - name: Probar desde fuente (Linux)
+        timeout-minutes: 5
         if: runner.os == 'Linux'
         run: xvfb-run -a -s "-screen 0 1920x1080x24" npm run prueba
       - name: Conservar prueba desde fuente
@@ -50,11 +53,13 @@ jobs:
         if: runner.os == 'Linux'
         run: npm run dist:linux
       - name: Probar empaquetado (Windows)
+        timeout-minutes: 5
         if: runner.os == 'Windows'
         env:
           BUTACA_EJECUTABLE: ${{ github.workspace }}/dist/win-unpacked/Butaca.exe
         run: npm run prueba
       - name: Probar empaquetado (Linux)
+        timeout-minutes: 5
         if: runner.os == 'Linux'
         env:
           BUTACA_EJECUTABLE: ${{ github.workspace }}/dist/linux-unpacked/butaca

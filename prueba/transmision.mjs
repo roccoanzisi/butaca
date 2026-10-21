@@ -221,4 +221,6 @@ try {
 console.log(`Sala: ${sala} | ${process.platform} | video: ${resultado.videoRecibido ? 'OK' : 'FALLÓ'} | ${resultado.videoWidth}x${resultado.videoHeight}`);
 console.log(`Demora: ${resultado.demora ?? 'sin datos'} | sonido: ${resultado.sonido ?? 'sin datos'}`);
 console.log(`Evidencia: ${salida}`);
-process.exitCode = resultado.videoRecibido && !resultado.error ? 0 : 1;
+// Salir sí o sí: un proceso de Electron vivo retiene la salida y cuelga el CI.
+try { app?.process()?.kill('SIGKILL'); } catch { /* ya cerrado */ }
+process.exit(resultado.videoRecibido && !resultado.error ? 0 : 1);
