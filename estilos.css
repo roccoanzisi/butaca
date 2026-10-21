@@ -237,6 +237,7 @@ body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .fila__butaca[data-ocupada] .fila__nombre { color: var(--texto); }
+.fila__butaca[data-problema] .fila__demora { color: #FFC37A; }
 .fila__demora { font-size: 0.68rem; color: var(--texto-suave); font-variant-numeric: tabular-nums; }
 
 /* ---------- Sala ---------- */

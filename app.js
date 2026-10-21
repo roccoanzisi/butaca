@@ -26,6 +26,15 @@ const NOTAS_CONTENIDO = {
 
 const $ = (id) => document.getElementById(id);
 
+// Opciones de PeerJS. Con ?ruta=relay se fuerza el TURN (para diagnosticar redes cerradas).
+function opcionesPeer() {
+  const opciones = { debug: 1 };
+  if (new URLSearchParams(location.search).get('ruta') === 'relay' && window.peerjs?.util?.defaultConfig) {
+    opciones.config = { ...window.peerjs.util.defaultConfig, iceTransportPolicy: 'relay' };
+  }
+  return opciones;
+}
+
 // ---------- Utilidades ----------
 
 const guardado = {
@@ -88,21 +97,6 @@ function ponerAire(prefijo, encendido) {
   $(prefijo + '-aire-texto').textContent = encendido ? 'En vivo' : 'Fuera del aire';
 }
 
-// Preferir H264: casi todas las compus lo codifican por hardware,
-// lo que baja la demora y la carga de CPU cuando hay varias butacas.
-function preferirH264(pc) {
-  if (!window.RTCRtpSender?.getCapabilities) return;
-  const codecs = RTCRtpSender.getCapabilities('video')?.codecs;
-  if (!codecs) return;
-  const orden = (c) => (/h264/i.test(c.mimeType) ? 0 : /vp8/i.test(c.mimeType) ? 1 : 2);
-  const ordenados = [...codecs].sort((a, b) => orden(a) - orden(b));
-  for (const t of pc.getTransceivers()) {
-    if (t.sender?.track?.kind === 'video' && t.setCodecPreferences) {
-      try { t.setCodecPreferences(ordenados); } catch { /* el navegador elige */ }
-    }
-  }
-}
-
 // Lee getStats y estima la demora de punta a punta del lado de quien mira.
 function crearMedidor() {
   let previo = null;
@@ -110,16 +104,23 @@ function crearMedidor() {
     const stats = await pc.getStats();
     let video = null;
     let rtt = null;
+    let par = null;
     stats.forEach((s) => {
       if (s.type === 'inbound-rtp' && s.kind === 'video') video = s;
-      if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated && s.currentRoundTripTime != null) {
-        rtt = s.currentRoundTripTime;
+      if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated) {
+        par = s;
+        if (s.currentRoundTripTime != null) rtt = s.currentRoundTripTime;
       }
     });
     if (!video) return null;
+    const ruta = par ? stats.get(par.localCandidateId)?.candidateType : null;
     let buffer = 0;
     let decodificar = 0;
+    let perdida = 0;
     if (previo) {
+      const perdidos = (video.packetsLost || 0) - (previo.packetsLost || 0);
+      const recibidos = (video.packetsReceived || 0) - (previo.packetsReceived || 0);
+      if (perdidos + recibidos > 0) perdida = Math.max(0, perdidos) / (Math.max(0, perdidos) + recibidos);
       const emitidos = (video.jitterBufferEmittedCount || 0) - (previo.jitterBufferEmittedCount || 0);
       if (emitidos > 0) buffer = ((video.jitterBufferDelay || 0) - (previo.jitterBufferDelay || 0)) / emitidos;
       const cuadros = (video.framesDecoded || 0) - (previo.framesDecoded || 0);
@@ -129,7 +130,40 @@ function crearMedidor() {
     // Red (ida) + buffer de jitter + decodificación + ~1 cuadro de captura/codificación.
     const fps = video.framesPerSecond || 30;
     const ms = Math.round(((rtt ?? 0) / 2 + buffer + decodificar) * 1000 + Math.min(1000 / fps, 34));
-    return { ms, ancho: video.frameWidth, alto: video.frameHeight, fps: Math.round(video.framesPerSecond || 0) };
+    return {
+      ms, ancho: video.frameWidth, alto: video.frameHeight, fps: Math.round(video.framesPerSecond || 0),
+      perdida, congelamientos: video.freezeCount || 0, relay: ruta === 'relay',
+    };
+  };
+}
+
+// Arranque rápido: WebRTC empieza en ~300 kbps y tarda medio minuto en llegar a HD.
+// Con x-google-start-bitrate arranca cerca de la calidad pedida (Chrome, Edge y la app).
+function arranqueRapido(kbps) {
+  return (sdp) => {
+    const lineas = sdp.split('\r\n');
+    const tipos = new Map();
+    for (const l of lineas) {
+      const m = /^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)\//i.exec(l);
+      if (m) tipos.set(m[1], true);
+    }
+    const salida = [];
+    for (const l of lineas) {
+      const fmtp = /^a=fmtp:(\d+) (.*)$/.exec(l);
+      if (fmtp && tipos.has(fmtp[1])) {
+        salida.push(l.includes('x-google-start-bitrate') ? l : `${l};x-google-start-bitrate=${kbps}`);
+        tipos.set(fmtp[1], false);
+        continue;
+      }
+      salida.push(l);
+      const rtpmap = /^a=rtpmap:(\d+) /.exec(l);
+      // VP8 no trae línea fmtp: se agrega una.
+      if (rtpmap && tipos.get(rtpmap[1]) && !lineas.some((x) => x.startsWith(`a=fmtp:${rtpmap[1]} `))) {
+        salida.push(`a=fmtp:${rtpmap[1]} x-google-start-bitrate=${kbps}`);
+        tipos.set(rtpmap[1], false);
+      }
+    }
+    return salida.join('\r\n');
   };
 }
 
@@ -199,16 +233,9 @@ function iniciarCabina(sala) {
     return;
   }
 
-  // Elegir H264 antes de cada oferta que arma PeerJS.
-  const crearOferta = RTCPeerConnection.prototype.createOffer;
-  RTCPeerConnection.prototype.createOffer = function (...args) {
-    preferirH264(this);
-    return crearOferta.apply(this, args);
-  };
-
   function conectar() {
     aviso('Conectando la cabina', 'Un momento.', false);
-    peer = new Peer(PREFIJO + sala, { debug: 1 });
+    peer = new Peer(PREFIJO + sala, opcionesPeer());
 
     peer.on('open', () => {
       intentosId = 0;
@@ -230,9 +257,11 @@ function iniciarCabina(sala) {
         if (!e || e.conn !== conn || !msg || typeof msg !== 'object') return;
         if (msg.tipo === 'demora' && Number.isFinite(msg.ms)) {
           e.demora = Math.max(0, Math.min(99999, Math.round(msg.ms)));
+          e.congelamientos = Number.isFinite(msg.congelamientos) ? Math.max(0, Math.round(msg.congelamientos)) : 0;
           dibujarFila();
         } else if (msg.tipo === 'vista' && typeof msg.valor === 'string' && Object.hasOwn(VISTAS, msg.valor)) {
           e.vista = msg.valor;
+          e.tope = null;
           const pc = e.llamada?.peerConnection;
           if (pc && pc.connectionState === 'connected') codificar(pc, e);
           dibujarFila();
@@ -291,7 +320,7 @@ function iniciarCabina(sala) {
     const e = espectadores.get(id);
     if (!e || !stream) return;
     e.llamada?.close();
-    const llamada = peer.call(id, stream, { metadata: { sala } });
+    const llamada = peer.call(id, stream, { metadata: { sala }, sdpTransform: arranqueRapido(Math.min(2500, techo(e))) });
     if (!llamada) return;
     e.llamada = llamada;
     const pc = llamada.peerConnection;
@@ -304,6 +333,67 @@ function iniciarCabina(sala) {
     llamada.on('error', () => { if (e.llamada === llamada) e.llamada = null; });
   }
 
+  // Bitrate máximo de una butaca según la calidad de la cabina y la que eligió la butaca.
+  function techo(e) {
+    const c = CALIDADES[calidad];
+    const v = VISTAS[e?.vista] || null;
+    return v ? Math.min(c.kbps, v.kbps) : c.kbps;
+  }
+
+  // Regulador por butaca: si hay pérdidas baja el tope y lo sostiene; si la red anda bien, lo sube despacio.
+  // Evita el sube y baja de calidad que produce el estimador de WebRTC probando más de lo que la red banca.
+  async function regular(e) {
+    const pc = e.llamada?.peerConnection;
+    if (!pc || pc.connectionState !== 'connected') return;
+    const stats = await pc.getStats();
+    let salida = null;
+    let remoto = null;
+    let par = null;
+    stats.forEach((x) => {
+      if (x.type === 'outbound-rtp' && x.kind === 'video') salida = x;
+      if (x.type === 'remote-inbound-rtp' && x.kind === 'video') remoto = x;
+      if (x.type === 'candidate-pair' && x.nominated && x.state === 'succeeded') par = x;
+    });
+    const maximo = techo(e);
+    const antes = e.tope ?? maximo;
+    let tope = Math.min(antes, maximo);
+    const perdida = remoto?.fractionLost ?? 0;
+    if (perdida > 0.04) {
+      tope = Math.max(500, Math.round(tope * 0.8));
+      e.estable = 0;
+    } else if (perdida < 0.01) {
+      e.estable = (e.estable || 0) + 1;
+      if (e.estable >= 5 && tope < maximo) { tope = Math.min(maximo, Math.round(tope * 1.1)); e.estable = 0; }
+    }
+    e.tope = tope;
+    if (tope !== antes) codificar(pc, e);
+    e.diag = {
+      limite: salida?.qualityLimitationReason || 'none',
+      relay: par ? stats.get(par.localCandidateId)?.candidateType === 'relay' : false,
+      perdida,
+    };
+  }
+
+  setInterval(() => {
+    for (const e of espectadores.values()) regular(e).catch(() => {});
+    if (stream) avisarLimites();
+  }, 2000);
+
+  // Si la mayoría de las copias están frenadas por CPU o por la subida, decirlo con qué hacer.
+  function avisarLimites() {
+    const nota = $('cabina-alerta');
+    const diags = [...espectadores.values()].map((e) => e.diag).filter(Boolean);
+    const cuantos = (motivo) => diags.filter((d) => d.limite === motivo).length;
+    if (!diags.length) { nota.textContent = ''; return; }
+    if (cuantos('cpu') * 2 > diags.length) {
+      nota.textContent = `Tu compu no da abasto codificando ${diags.length === 1 ? 'la transmisión' : diags.length + ' copias'}: bajá a 720p o cerrá programas pesados.`;
+    } else if (cuantos('bandwidth') * 2 > diags.length) {
+      nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
+    } else {
+      nota.textContent = '';
+    }
+  }
+
   // Cada butaca tiene su propia copia: se ajusta resolución y bitrate sólo para ella.
   function codificar(pc, e) {
     const c = CALIDADES[calidad];
@@ -314,11 +404,12 @@ function iniciarCabina(sala) {
       if (!p.encodings || !p.encodings.length) p.encodings = [{}];
       const altoFuente = sender.track.getSettings().height || c.alto;
       p.encodings[0].scaleResolutionDownBy = v ? Math.max(1, altoFuente / v.alto) : 1;
-      p.encodings[0].maxBitrate = (v ? Math.min(c.kbps, v.kbps) : c.kbps) * 1000;
+      p.encodings[0].maxBitrate = Math.min(techo(e), e?.tope ?? Infinity) * 1000;
       p.encodings[0].maxFramerate = v ? Math.min(c.fps, v.fps) : c.fps;
       p.encodings[0].priority = 'high';
       p.encodings[0].networkPriority = 'high';
-      p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'maintain-framerate';
+      // "balanced": ante poca red baja un poco resolución y un poco fluidez, sin desplomar ninguna.
+      p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'balanced';
       sender.setParameters(p).catch(() => {});
     }
   }
@@ -334,6 +425,7 @@ function iniciarCabina(sala) {
     }
     if (!stream) return;
     for (const e of espectadores.values()) {
+      e.tope = null;
       const pc = e.llamada?.peerConnection;
       if (pc && pc.connectionState === 'connected') codificar(pc, e);
     }
@@ -631,6 +723,13 @@ function iniciarCabina(sala) {
         demora.className = 'fila__demora';
         const vista = e.vista === 'auto' ? '' : e.vista + 'p ';
         demora.textContent = e.demora != null && stream ? vista + e.demora + ' ms' : vista.trim();
+        const problemas = [];
+        if (e.diag?.relay) problemas.push('conexión por servidor');
+        if ((e.diag?.perdida ?? 0) > 0.04) problemas.push(`pierde ${Math.round(e.diag.perdida * 100)}% de los datos`);
+        if (problemas.length) {
+          li.dataset.problema = '';
+          li.title = e.nombre + ': ' + problemas.join(', ');
+        }
         li.append(demora);
       }
       fila.append(li);
@@ -807,7 +906,7 @@ function mirar(sala, nombre) {
 
   function conectar() {
     aviso('Buscando la sala', 'Un momento.');
-    peer = new Peer({ debug: 1 });
+    peer = new Peer(opcionesPeer());
     peer.on('open', conectarCabina);
     peer.on('call', atender);
     peer.on('disconnected', () => recuperar(peer));
@@ -889,17 +988,14 @@ function mirar(sala, nombre) {
     llamada?.close();
     llamada = nueva;
     mids = null;
-    nueva.answer();
+    nueva.answer(undefined, { sdpTransform: arranqueRapido(2500) });
     const pc = nueva.peerConnection;
     nueva.on('stream', (s) => {
       // PeerJS avisa una vez por pista (video y audio): reproducir una sola vez.
       if (llamada !== nueva || recibido === s) return;
       recibido = s;
-      // Demora mínima: sin colchón extra en el buffer de jitter.
-      for (const r of pc.getReceivers()) {
-        if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
-        else if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
-      }
+      // Sin tocar el buffer de jitter: el adaptativo de WebRTC suaviza los tirones
+      // a cambio de unos pocos milisegundos (forzarlo a 0 se veía entrecortado).
       video.srcObject = new MediaStream(s.getVideoTracks());
       asignarAudio(pc);
       video.dataset.activo = '';
@@ -968,9 +1064,12 @@ function mirar(sala, nombre) {
       const m = await medir(pc);
       if (!m) return;
       const resolucion = m.alto ? m.alto + 'p' : '';
-      demoraEl.textContent = `${resolucion} ${m.fps} fps, demora ≈ ${m.ms} ms`.trim();
-      demoraEl.dataset.tono = m.ms <= 250 ? 'bien' : m.ms > 600 ? 'alerta' : '';
-      if (conn?.open) conn.send({ tipo: 'demora', ms: m.ms });
+      let texto = `${resolucion} ${m.fps} fps, demora ≈ ${m.ms} ms`.trim();
+      if (m.perdida > 0.02) texto += `, se pierde el ${Math.round(m.perdida * 100)}% de los datos`;
+      if (m.relay) texto += ', conexión por servidor';
+      demoraEl.textContent = texto;
+      demoraEl.dataset.tono = m.ms > 600 || m.perdida > 0.04 ? 'alerta' : m.ms <= 250 ? 'bien' : '';
+      if (conn?.open) conn.send({ tipo: 'demora', ms: m.ms, congelamientos: m.congelamientos });
     } catch { /* sin estadísticas */ }
   }, 1000);
 
