@@ -11,8 +11,12 @@ const PRUEBA = process.env.BUTACA_PRUEBA === '1';
 const WAYLAND = process.platform === 'linux' && process.env.XDG_SESSION_TYPE === 'wayland'
   && !app.commandLine.getSwitchValue('ozone-platform').includes('x11');
 
-// Codificación y decodificación de video por la placa (VA-API) en Linux; en Windows Chromium ya usa la GPU.
-if (process.platform === 'linux') {
+// Captura y codificación por la placa de video.
+// Windows: captura con Windows Graphics Capture (GPU), mucho más rápida que la copia por CPU de la pantalla.
+// Linux: codificación y decodificación por VA-API.
+if (process.platform === 'win32') {
+  app.commandLine.appendSwitch('enable-features', 'AllowWgcScreenCapturer,AllowWgcWindowCapturer,AllowWgcZeroHz');
+} else if (process.platform === 'linux') {
   app.commandLine.appendSwitch('enable-features', 'AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiVideoDecoder,VaapiIgnoreDriverChecks');
 }
 

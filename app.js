@@ -609,7 +609,9 @@ function iniciarCabina(sala) {
       } else if (limite === 'bandwidth') {
         nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
       } else if (fpsCaptura && fpsCaptura < CALIDADES[calidad].fps * 0.6) {
-        nota.textContent = 'La pantalla se captura a pocos cuadros. Si es un juego a pantalla completa, ponelo en "ventana sin bordes" o compartí la ventana del juego.';
+        nota.textContent = /Firefox\//.test(navigator.userAgent)
+          ? 'Firefox captura la pantalla a pocos cuadros. Para que se vea fluido, transmití desde Chrome, Edge o la app de Butaca.'
+          : 'La pantalla se captura a pocos cuadros. Compartí la ventana del juego (no la pantalla entera) y ponelo en "ventana sin bordes". La app de Butaca captura más rápido.';
       } else {
         nota.textContent = '';
       }
