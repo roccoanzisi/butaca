@@ -11,6 +11,11 @@ const PRUEBA = process.env.BUTACA_PRUEBA === '1';
 const WAYLAND = process.platform === 'linux' && process.env.XDG_SESSION_TYPE === 'wayland'
   && !app.commandLine.getSwitchValue('ozone-platform').includes('x11');
 
+// Codificación y decodificación de video por la placa (VA-API) en Linux; en Windows Chromium ya usa la GPU.
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('enable-features', 'AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiVideoDecoder,VaapiIgnoreDriverChecks');
+}
+
 let pedido = null; // { id, sonido } para el próximo getDisplayMedia (id null: elegir sola)
 
 function crearVentana() {

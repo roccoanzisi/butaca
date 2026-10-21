@@ -28,7 +28,9 @@ jobs:
         run: |
           npx playwright install --with-deps chromium
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb pulseaudio
+          # Servidor de audio para probar el sonido de la compu (loopback).
+          pulseaudio --start --exit-idle-time=-1
       - name: Probar desde fuente (Windows)
         timeout-minutes: 5
         if: runner.os == 'Windows'

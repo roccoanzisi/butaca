@@ -138,6 +138,38 @@ class Canal {
   }
 }
 
+// Elige el codec de la cabina: H264 si la placa de video lo codifica (no le quita CPU al juego),
+// si no VP8 por software. Con ?codec=h264 o ?codec=vp8 se fuerza (para pruebas).
+async function elegirCodec(c) {
+  const forzado = new URLSearchParams(location.search).get('codec');
+  if (forzado === 'h264' || forzado === 'vp8') return { codec: forzado, hardware: null };
+  try {
+    const info = await navigator.mediaCapabilities.encodingInfo({
+      type: 'webrtc',
+      video: { contentType: 'video/H264', width: c.ancho, height: c.alto, bitrate: c.kbps * 1000, framerate: c.fps },
+    });
+    if (info.supported && info.powerEfficient) return { codec: 'h264', hardware: true };
+  } catch { /* sin datos: VP8 */ }
+  return { codec: 'vp8', hardware: false };
+}
+
+// Pone primero el codec elegido (los demás quedan de respaldo).
+function preferirCodec(transceptor, codec) {
+  const todos = RTCRtpSender.getCapabilities?.('video')?.codecs;
+  if (!todos || !transceptor.setCodecPreferences) return;
+  const tipo = codec === 'h264' ? 'video/h264' : 'video/vp8';
+  const elegidos = todos.filter((x) => x.mimeType.toLowerCase() === tipo);
+  // H264: primero el perfil "constrained baseline" con packetization-mode=1, el más compatible.
+  if (codec === 'h264') {
+    const puntaje = (x) => (/packetization-mode=1/.test(x.sdpFmtpLine || '') ? 2 : 0) + (/profile-level-id=42e0/.test(x.sdpFmtpLine || '') ? 1 : 0);
+    elegidos.sort((a, b) => puntaje(b) - puntaje(a));
+  }
+  if (!elegidos.length) return;
+  try {
+    transceptor.setCodecPreferences([...elegidos, ...todos.filter((x) => !elegidos.includes(x))]);
+  } catch { /* el navegador elige */ }
+}
+
 // Servidores ICE que manda el servidor (STUN y TURN de Cloudflare). Con ?ruta=relay se fuerza el TURN.
 function configuracionRtc(ice) {
   const config = { iceServers: Array.isArray(ice) && ice.length ? ice : [{ urls: 'stun:stun.cloudflare.com:3478' }], bundlePolicy: 'max-bundle' };
@@ -224,6 +256,8 @@ function crearMedidor() {
     });
     if (!video) return null;
     const ruta = par ? stats.get(par.localCandidateId)?.candidateType : null;
+    let descartados = 0;
+    let recibidosFps = 0;
     let buffer = 0;
     let decodificar = 0;
     let perdida = 0;
@@ -236,13 +270,20 @@ function crearMedidor() {
       const cuadros = (video.framesDecoded || 0) - (previo.framesDecoded || 0);
       if (cuadros > 0) decodificar = ((video.totalDecodeTime || 0) - (previo.totalDecodeTime || 0)) / cuadros;
     }
+    if (previo) {
+      const segundos = (video.timestamp - previo.timestamp) / 1000 || 1;
+      const nuevos = (video.framesReceived || 0) - (previo.framesReceived || 0);
+      recibidosFps = Math.round(nuevos / segundos);
+      const tirados = (video.framesDropped || 0) - (previo.framesDropped || 0);
+      if (nuevos > 0) descartados = Math.max(0, tirados) / nuevos;
+    }
     previo = video;
     // Red (ida) + buffer de jitter + decodificación + ~1 cuadro de captura/codificación.
     const fps = video.framesPerSecond || 30;
     const ms = Math.round(((rtt ?? 0) / 2 + buffer + decodificar) * 1000 + Math.min(1000 / fps, 34));
     return {
       ms, ancho: video.frameWidth, alto: video.frameHeight, fps: Math.round(video.framesPerSecond || 0),
-      perdida, congelamientos: video.freezeCount || 0, relay: ruta === 'relay',
+      perdida, congelamientos: video.freezeCount || 0, relay: ruta === 'relay', descartados, recibidosFps,
     };
   };
 }
@@ -323,6 +364,8 @@ function iniciarCabina(sala) {
   let ice = null;
   let pc = null; // conexión con el SFU de Cloudflare
   let transceptores = null; // { video, pantalla, micro }
+  let codificador = null; // { codec, hardware }
+  let sinPlaca = false; // se probó H264 por placa de video y no anduvo: VP8 hasta recargar
   const btnMicro = $('btn-micro');
   let microActivo = false;
   let intentosOcupada = 0;
@@ -421,6 +464,9 @@ function iniciarCabina(sala) {
       pantalla: nueva.addTransceiver(audio.pantalla, { direction: 'sendonly', streams: [stream] }),
       micro: nueva.addTransceiver(audio.micro, { direction: 'sendonly', streams: [stream] }),
     };
+    codificador = sinPlaca ? { codec: 'vp8', hardware: false } : await elegirCodec(c);
+    if (pc !== nueva) return;
+    preferirCodec(transceptores.video, codificador.codec);
     nueva.addEventListener('connectionstatechange', () => {
       if (pc !== nueva || nueva.connectionState !== 'failed' || !stream) return;
       setTimeout(() => { if (pc === nueva && stream) publicar().catch(errorPublicar); }, 1500);
@@ -444,6 +490,30 @@ function iniciarCabina(sala) {
       ponerAire('cabina', true);
       $('cabina-aviso').hidden = true;
     }
+    if (codificador.hardware) vigilarPlaca(nueva);
+  }
+
+  // Seguro: si con H264 no codifica de verdad la placa de video (por ejemplo, Chrome cae al codificador
+  // por software al hacer simulcast) o saca pocos cuadros, volver a VP8, que por software anda mucho mejor.
+  function vigilarPlaca(conexion) {
+    setTimeout(async () => {
+      if (pc !== conexion || !stream) return;
+      try {
+        const stats = await conexion.getStats();
+        let salida = null;
+        let fuente = null;
+        stats.forEach((x) => {
+          if (x.type === 'outbound-rtp' && x.kind === 'video' && x.rid === 'f') salida = x;
+          if (x.type === 'media-source' && x.kind === 'video') fuente = x;
+        });
+        const placa = salida?.powerEfficientEncoder === true || /MediaFoundation|NVENC|AMF|QuickSync|Vaapi|VideoToolbox/i.test(salida?.encoderImplementation || '');
+        const lenta = (salida?.framesPerSecond || 0) < (fuente?.framesPerSecond || 30) * 0.7;
+        if (!placa || /OpenH264/i.test(salida?.encoderImplementation || '') || lenta) {
+          sinPlaca = true;
+          publicar().catch(errorPublicar);
+        }
+      } catch { /* sin estadísticas: dejar como está */ }
+    }, 8000);
   }
 
   function errorPublicar(err) {
@@ -458,13 +528,21 @@ function iniciarCabina(sala) {
     if (!sender) return;
     const p = sender.getParameters();
     if (!p.encodings?.length) return;
-    const capas = capasSimulcast(CALIDADES[calidad]);
+    const c = CALIDADES[calidad];
+    const capas = capasSimulcast(c);
     for (const enc of p.encodings) {
       const capa = capas.find((x) => x.rid === enc.rid);
       if (capa) Object.assign(enc, capa);
+      // Alivio de CPU: 1) apagar la capa media; 2) además, la completa a 720p.
+      enc.active = !(alivio >= 1 && enc.rid === 'h');
+      if (alivio >= 2 && enc.rid === 'f' && c.alto > 720) {
+        enc.scaleResolutionDownBy = c.alto / 720;
+        enc.maxBitrate = Math.min(enc.maxBitrate, 3500 * 1000);
+      }
     }
-    // "balanced": ante poca red baja un poco resolución y un poco fluidez, sin desplomar ninguna.
-    p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'balanced';
+    // Juego o video: mantener los cuadros por segundo (con el SFU la subida ya no se satura,
+    // y si falta CPU conviene bajar resolución antes que fluidez). Texto: mantener la nitidez.
+    p.degradationPreference = contenido === 'texto' ? 'maintain-resolution' : 'maintain-framerate';
     sender.setParameters(p).catch(() => {});
   }
 
@@ -480,19 +558,55 @@ function iniciarCabina(sala) {
     dibujarFila();
   }
 
-  // Si la imagen está frenada por la CPU o por la subida, decirlo con qué hacer.
+  // Diagnóstico de lo que sale: cuadros capturados, cuadros enviados y qué los frena.
+  // Si la CPU no da abasto, la cabina se alivia sola por pasos y vuelve cuando se libera.
+  let alivio = 0;
+  let segundosCpu = 0;
+  let segundosBien = 0;
   setInterval(async () => {
-    if (!pc || !stream) return;
+    if (!pc || !stream) { $('cabina-salida').textContent = ''; return; }
     try {
       const stats = await pc.getStats();
-      let limite = 'none';
+      let salida = null;
+      let captura = null;
       stats.forEach((x) => {
-        if (x.type === 'outbound-rtp' && x.kind === 'video' && (x.rid === 'f' || !x.rid)) limite = x.qualityLimitationReason || 'none';
+        if (x.type === 'outbound-rtp' && x.kind === 'video' && (x.rid === 'f' || !x.rid)) salida = x;
+        if (x.type === 'media-source' && x.kind === 'video') captura = x;
       });
+      if (!salida) return;
+      const limite = salida.qualityLimitationReason || 'none';
+      const fpsSale = Math.round(salida.framesPerSecond || 0);
+      const fpsCaptura = Math.round(captura?.framesPerSecond || 0);
+      const codec = stats.get(salida.codecId)?.mimeType?.split('/')[1] || '';
+      // encoderImplementation y powerEfficientEncoder dicen si de verdad codifica la placa de video.
+      const placa = salida.powerEfficientEncoder === true
+        || /MediaFoundation|NVENC|Nvidia|AMF|QuickSync|VAAPI|Vaapi|VideoToolbox|ExternalEncoder/i.test(salida.encoderImplementation || '');
+      $('cabina-salida').textContent = `Sale en ${salida.frameHeight || '?'}p a ${fpsSale} fps (captura a ${fpsCaptura} fps), `
+        + `codificado con ${placa ? 'la placa de video' : 'el procesador'}${codec ? ' en ' + codec : ''}.`;
+
+      if (limite === 'cpu') {
+        segundosCpu += 3;
+        segundosBien = 0;
+        if (segundosCpu >= 6 && alivio < 2) { alivio++; segundosCpu = 0; ajustarVideo(); }
+      } else {
+        segundosCpu = 0;
+        segundosBien += 3;
+        if (segundosBien >= 60 && alivio > 0) { alivio--; segundosBien = 0; ajustarVideo(); }
+      }
+
       const nota = $('cabina-alerta');
-      if (limite === 'cpu') nota.textContent = 'Tu compu no da abasto codificando: bajá a 720p o cerrá programas pesados.';
-      else if (limite === 'bandwidth') nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
-      else if (!nota.textContent.startsWith('No se pudo')) nota.textContent = '';
+      if (nota.textContent.startsWith('No se pudo') || nota.textContent.startsWith('Se cortó')) return;
+      if (limite === 'cpu' || alivio > 0) {
+        nota.textContent = alivio >= 2
+          ? 'Tu compu no da abasto codificando: bajé la imagen a 720p para mantener la fluidez. Cerrar programas pesados ayuda.'
+          : 'Tu compu está justa codificando: apagué la calidad media para mantener la fluidez.';
+      } else if (limite === 'bandwidth') {
+        nota.textContent = 'Tu subida de internet no alcanza para esta calidad: bajá a 720p para que se vea parejo.';
+      } else if (fpsCaptura && fpsCaptura < CALIDADES[calidad].fps * 0.6) {
+        nota.textContent = 'La pantalla se captura a pocos cuadros. Si es un juego a pantalla completa, ponelo en "ventana sin bordes" o compartí la ventana del juego.';
+      } else {
+        nota.textContent = '';
+      }
     } catch { /* sin estadísticas */ }
   }, 3000);
 
@@ -609,7 +723,10 @@ function iniciarCabina(sala) {
         captura = await pedir(sonidoCompu);
       } catch (err) {
         // En la app, una compu sin salida de audio puede rechazar el loopback: probar sólo con imagen.
-        if (!escritorio || !sonidoCompu || err.name === 'NotAllowedError' || err.name === 'AbortError') throw err;
+        // Con la fuente ya elegida (selector propio o prueba) no hay cancelación posible: cualquier error
+        // con sonido pedido es del loopback (por ejemplo, compu sin servidor de audio).
+        const cancelado = (err.name === 'NotAllowedError' || err.name === 'AbortError') && !escritorio?.selectorPropio && !escritorio?.prueba;
+        if (!escritorio || !sonidoCompu || cancelado) throw err;
         captura = await pedir(false);
       }
     } catch (err) {
@@ -710,6 +827,7 @@ function iniciarCabina(sala) {
     pc?.close();
     pc = null;
     transceptores = null;
+    alivio = 0;
     canal?.pedido('cortar').catch(() => {});
     video.srcObject = null;
     delete video.dataset.activo;
@@ -1100,6 +1218,9 @@ function mirar(sala, nombre) {
       let texto = `${resolucion} ${m.fps} fps, demora ≈ ${m.ms} ms`.trim();
       if (m.perdida > 0.02) texto += `, se pierde el ${Math.round(m.perdida * 100)}% de los datos`;
       if (m.relay) texto += ', conexión por servidor TURN';
+      // Si llegan más cuadros de los que esta compu llega a mostrar, el límite es local.
+      if (m.descartados > 0.2) texto += '. Tu compu no llega a mostrar todos los cuadros: elegí calidad Media';
+      else if (m.recibidosFps && m.recibidosFps < 18 && m.perdida < 0.02) texto += '. Los cuadros ya salen así desde la cabina';
       demoraEl.textContent = texto;
       demoraEl.dataset.tono = m.ms > 600 || m.perdida > 0.04 ? 'alerta' : m.ms <= 250 ? 'bien' : '';
       if (Date.now() - ultimaMedida >= 4000) {
